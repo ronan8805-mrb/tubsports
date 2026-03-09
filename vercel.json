@@ -1,0 +1,8 @@
+{
+  "buildCommand": "cd horse/frontend && npm install && npm run build",
+  "outputDirectory": "horse/frontend/dist",
+  "framework": "vite",
+  "rewrites": [
+    { "source": "/(.*)", "destination": "/index.html" }
+  ]
+}
