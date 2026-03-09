@@ -16,7 +16,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
 from ..config import API_PORT, DB_PATH
-from ..db import get_connection, get_db_stats
+from ..db import get_connection, get_db_stats, init_database
 from ..features import build_features_for_races, get_feature_columns
 from ..prediction_db import get_pred_connection
 from .auth import router as auth_router, ensure_users_table, seed_admin, require_admin, get_current_user
@@ -94,6 +94,15 @@ app.include_router(auth_router)
 def _get_con():
     """Get a read-only DB connection."""
     return get_connection(read_only=True)
+
+
+@app.on_event("startup")
+def _init_db_on_startup():
+    """Create main database if it doesn't exist (fresh Render deploy)."""
+    try:
+        init_database()
+    except Exception as e:
+        logger.warning(f"DB init: {e}")
 
 
 @app.on_event("startup")
