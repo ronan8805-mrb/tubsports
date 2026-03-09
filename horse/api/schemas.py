@@ -83,6 +83,32 @@ class DateInfo(BaseModel):
     races: int = 0
 
 
+class BestBetRunner(BaseModel):
+    horse_name: str
+    course: str
+    race_time: Optional[str] = None
+    race_name: Optional[str] = None
+    race_id: int
+    win_prob: float = 0.0
+    place_prob: float = 0.0
+    pct_gap: float = 0.0
+    fair_odds: float = 0.0
+    back_odds: Optional[float] = None
+    value_flag: Optional[str] = None
+    jockey: Optional[str] = None
+    trainer: Optional[str] = None
+    official_rating: Optional[int] = None
+    confidence: float = 0.0
+    reason: str = ""
+
+
+class BestBetsResponse(BaseModel):
+    date: str
+    picks: List[BestBetRunner]
+    total_races_scanned: int = 0
+    timestamp: str
+
+
 class HealthResponse(BaseModel):
     status: str
     timestamp: str

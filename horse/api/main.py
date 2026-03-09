@@ -5,13 +5,13 @@ Runs on port 8002, completely separate from greyhound (port 8000).
 
 import logging
 import threading
-from datetime import date, datetime
+from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
 import pandas as pd
 
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -19,7 +19,10 @@ from ..config import API_PORT, DB_PATH
 from ..db import get_connection, get_db_stats
 from ..features import build_features_for_races, get_feature_columns
 from ..prediction_db import get_pred_connection
+from .auth import router as auth_router, ensure_users_table, seed_admin, require_admin, get_current_user
 from .schemas import (
+    BestBetRunner,
+    BestBetsResponse,
     DateInfo,
     DimensionScore,
     DriverItem,
@@ -32,6 +35,44 @@ from .schemas import (
 from .thirteen_d import compute_thirteen_d_scores, compute_drivers
 
 logger = logging.getLogger(__name__)
+
+
+def _predict_stacked(model_data: dict, X, feature_names: list):
+    """Run prediction through stacked ensemble or fallback to weighted average."""
+    import numpy as np
+    import xgboost as xgb
+
+    lgb_probs = model_data["lgb_model"].predict(X)
+    xgb_probs = model_data["xgb_model"].predict(
+        xgb.DMatrix(X, feature_names=feature_names)
+    )
+
+    meta_learner = model_data.get("meta_learner")
+    if meta_learner is not None:
+        base_preds = {"lgb": lgb_probs, "xgb": xgb_probs}
+        cb = model_data.get("catboost_model")
+        if cb is not None:
+            try:
+                base_preds["catboost"] = cb.predict_proba(X)[:, 1]
+            except Exception:
+                pass
+        ridge = model_data.get("ridge_model")
+        if ridge is not None:
+            try:
+                base_preds["ridge"] = ridge.predict_proba(X.fillna(0))[:, 1]
+            except Exception:
+                pass
+        stack = np.column_stack([base_preds[k] for k in sorted(base_preds.keys())])
+        probs = meta_learner.predict_proba(stack)[:, 1]
+    else:
+        lgb_w = model_data.get("lgb_weight", 0.5)
+        probs = lgb_w * lgb_probs + (1.0 - lgb_w) * xgb_probs
+
+    if model_data.get("calibrator") is not None:
+        probs = model_data["calibrator"].predict(probs)
+
+    return probs
+
 
 app = FastAPI(
     title="Horse Racing 13D Engine",
@@ -47,10 +88,22 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(auth_router)
+
 
 def _get_con():
     """Get a read-only DB connection."""
     return get_connection(read_only=True)
+
+
+@app.on_event("startup")
+def _init_auth_on_startup():
+    """Create users table and seed admin account."""
+    try:
+        ensure_users_table()
+        seed_admin()
+    except Exception as e:
+        logger.warning(f"Auth init: {e}")
 
 
 @app.on_event("startup")
@@ -175,8 +228,9 @@ def get_available_dates(limit: int = Query(30, ge=1, le=365)):
                    COUNT(DISTINCT ra.race_id) AS races
             FROM meetings m
             JOIN races ra ON ra.meeting_id = m.meeting_id
+            WHERE m.meeting_date >= current_date
             GROUP BY m.meeting_date
-            ORDER BY m.meeting_date DESC
+            ORDER BY m.meeting_date ASC
             LIMIT ?
         """, [limit]).fetchall()
 
@@ -255,24 +309,13 @@ def get_thirteen_d(race_id: int):
             place_model = load_model("place")
 
             feature_names = win_model["feature_names"]
-            import xgboost as xgb
 
             X = features_df.reindex(columns=feature_names).copy()
-            import pandas as pd
             for col in X.columns:
                 X[col] = pd.to_numeric(X[col], errors="coerce")
 
-            lgb_win = win_model["lgb_model"].predict(X)
-            xgb_win = win_model["xgb_model"].predict(
-                xgb.DMatrix(X, feature_names=feature_names)
-            )
-            ens_win = 0.5 * lgb_win + 0.5 * xgb_win
-
-            lgb_place = place_model["lgb_model"].predict(X)
-            xgb_place = place_model["xgb_model"].predict(
-                xgb.DMatrix(X, feature_names=feature_names)
-            )
-            ens_place = 0.5 * lgb_place + 0.5 * xgb_place
+            ens_win = _predict_stacked(win_model, X, feature_names)
+            ens_place = _predict_stacked(place_model, X, feature_names)
 
             for i, (_, row) in enumerate(features_df.iterrows()):
                 name = row.get("horse_name", "")
@@ -533,8 +576,8 @@ def _run_scrape():
 
 
 @app.post("/api/scrape-racecards")
-def scrape_racecards():
-    """Trigger a background scrape of upcoming racecards."""
+def scrape_racecards(user: dict = Depends(require_admin)):
+    """Trigger a background scrape of upcoming racecards. Admin only."""
     with _scrape_lock:
         if _scrape_state["running"]:
             return {"status": "already_running", "started_at": _scrape_state["started_at"]}
@@ -628,9 +671,38 @@ def _run_odds_refresh():
                     logger.debug(f"Odds refresh for {horse_name}: {e}")
                     continue
 
-            # Store in memory cache only -- no DB writes
             _odds_cache[race_id] = (datetime.now().timestamp(), odds_map)
             count += 1
+
+        # Persist odds to market_data table for historical analysis
+        try:
+            persist_con = get_connection(read_only=False)
+            try:
+                for race_id, (ts, odds_map) in _odds_cache.items():
+                    for horse_name, dec_odds in odds_map.items():
+                        try:
+                            existing = persist_con.execute(
+                                "SELECT market_id FROM market_data WHERE race_id = ? AND horse_name = ?",
+                                [race_id, horse_name]
+                            ).fetchone()
+                            if existing:
+                                persist_con.execute("""
+                                    UPDATE market_data SET back_odds = ?, captured_at = current_timestamp
+                                    WHERE market_id = ?
+                                """, [dec_odds, existing[0]])
+                            else:
+                                mid = persist_con.execute("SELECT nextval('seq_market_id')").fetchone()[0]
+                                persist_con.execute("""
+                                    INSERT INTO market_data (market_id, race_id, horse_name, back_odds, captured_at)
+                                    VALUES (?, ?, ?, ?, current_timestamp)
+                                """, [mid, race_id, horse_name, dec_odds])
+                        except Exception:
+                            pass
+            finally:
+                persist_con.close()
+            logger.info(f"Odds persisted to market_data table")
+        except Exception as e:
+            logger.debug(f"Odds persistence failed: {e}")
 
         with _odds_lock:
             _odds_state["running"] = False
@@ -638,7 +710,7 @@ def _run_odds_refresh():
             _odds_state["result"] = "success"
             _odds_state["races_processed"] = count
             _odds_state["error"] = None
-        logger.info(f"Odds refresh completed: {count} races (in-memory only)")
+        logger.info(f"Odds refresh completed: {count} races")
     except Exception as e:
         logger.error(f"Odds refresh failed: {e}")
         with _odds_lock:
@@ -649,8 +721,8 @@ def _run_odds_refresh():
 
 
 @app.post("/api/refresh-odds")
-def refresh_odds():
-    """Trigger a background refresh of live odds for today/tomorrow."""
+def refresh_odds(user: dict = Depends(require_admin)):
+    """Trigger a background refresh of live odds for today/tomorrow. Admin only."""
     with _odds_lock:
         if _odds_state["running"]:
             return {"status": "already_running", "started_at": _odds_state["started_at"]}
@@ -678,6 +750,318 @@ def clear_odds_cache():
     """Clear the in-memory odds cache so next race load fetches fresh."""
     _odds_cache.clear()
     return {"status": "cleared"}
+
+
+# ---------------------------------------------------------------------------
+# Best Bets - Top 3 E/W picks across all meetings for a date
+# ---------------------------------------------------------------------------
+
+@app.get("/api/best-bets", response_model=BestBetsResponse)
+def get_best_bets(date: Optional[str] = Query(None, description="YYYY-MM-DD")):
+    """Top 3 each-way Trixie picks across all meetings for a given date."""
+    import numpy as np
+    import xgboost as xgb
+    from datetime import date as date_type
+
+    target_date = date or str(date_type.today())
+
+    con = _get_con()
+    try:
+        race_rows = con.execute("""
+            SELECT ra.race_id, m.course, ra.race_name,
+                   COALESCE(ra.race_time, strftime(ra.off_dt, '%H:%M')) as race_time,
+                   ra.num_runners, ra.api_race_id
+            FROM races ra
+            JOIN meetings m ON ra.meeting_id = m.meeting_id
+            WHERE m.meeting_date = ? AND ra.num_runners >= 4
+            ORDER BY ra.off_dt
+        """, [target_date]).fetchall()
+
+        if not race_rows:
+            return BestBetsResponse(
+                date=target_date, picks=[], total_races_scanned=0,
+                timestamp=datetime.now().isoformat(),
+            )
+
+        race_ids = [r[0] for r in race_rows]
+        race_meta = {r[0]: {"course": r[1], "race_name": r[2], "race_time": r[3],
+                            "num_runners": r[4], "api_race_id": r[5]} for r in race_rows}
+
+        features_df = build_features_for_races(con, race_ids)
+    finally:
+        con.close()
+
+    if features_df.empty:
+        return BestBetsResponse(
+            date=target_date, picks=[], total_races_scanned=len(race_ids),
+            timestamp=datetime.now().isoformat(),
+        )
+
+    try:
+        from ..models import load_model
+        win_model = load_model("win")
+        place_model = load_model("place")
+        feature_names = win_model["feature_names"]
+
+        X = features_df.reindex(columns=feature_names).copy()
+        for col in X.columns:
+            X[col] = pd.to_numeric(X[col], errors="coerce")
+
+        win_probs = _predict_stacked(win_model, X, feature_names)
+        place_probs = _predict_stacked(place_model, X, feature_names)
+
+        if win_model.get("calibrator") is not None:
+            win_probs = win_model["calibrator"].predict(np.array(win_probs))
+        if place_model.get("calibrator") is not None:
+            place_probs = place_model["calibrator"].predict(np.array(place_probs))
+
+        features_df = features_df.copy()
+        features_df["_win_prob"] = win_probs
+        features_df["_place_prob"] = place_probs
+        features_df["_ew_score"] = 0.3 * win_probs + 0.7 * place_probs
+    except Exception as e:
+        logger.warning(f"Best bets model load failed: {e}")
+        return BestBetsResponse(
+            date=target_date, picks=[], total_races_scanned=len(race_ids),
+            timestamp=datetime.now().isoformat(),
+        )
+
+    con2 = _get_con()
+    try:
+        jt_rows = con2.execute("""
+            SELECT horse_name, jockey_name, trainer_name, race_id
+            FROM results WHERE race_id IN ({})
+        """.format(",".join(str(r) for r in race_ids))).fetchall()
+        jt_map = {(r[0], r[3]): (r[1], r[2]) for r in jt_rows}
+    except Exception:
+        jt_map = {}
+    finally:
+        con2.close()
+
+    candidates = []
+    for race_id, group in features_df.groupby("race_id"):
+        meta = race_meta.get(race_id, {})
+        nr = meta.get("num_runners", len(group))
+        if nr < 4:
+            continue
+
+        sorted_group = group.sort_values("_ew_score", ascending=False)
+        top = sorted_group.iloc[0]
+
+        wp = float(top["_win_prob"])
+        pp = float(top["_place_prob"])
+        ew = float(top["_ew_score"])
+        gap = pp - wp
+        field_avg_pp = group["_place_prob"].mean()
+        edge = pp - field_avg_pp
+
+        jt = jt_map.get((top["horse_name"], race_id), (None, None))
+
+        reason_parts = []
+        if pp > 0.45:
+            reason_parts.append("strong place chance")
+        if wp > 0.2:
+            reason_parts.append("genuine win contender")
+        if gap > 0.25:
+            reason_parts.append(f"{gap*100:.0f}% place safety net")
+        if edge > 0.15:
+            reason_parts.append("big edge over field")
+        if top.get("form_avg_pos_3") and float(top.get("form_avg_pos_3", 99)) <= 3.0:
+            reason_parts.append("consistent recent form")
+        if not reason_parts:
+            reason_parts.append("best E/W value in race")
+
+        candidates.append({
+            "horse_name": str(top["horse_name"]),
+            "course": meta.get("course", ""),
+            "race_time": meta.get("race_time"),
+            "race_name": meta.get("race_name"),
+            "race_id": int(race_id),
+            "win_prob": round(wp, 4),
+            "place_prob": round(pp, 4),
+            "pct_gap": round(gap, 4),
+            "fair_odds": round(1.0 / max(wp, 0.001), 2),
+            "jockey": jt[0],
+            "trainer": jt[1],
+            "official_rating": int(top["official_rating"]) if pd.notna(top.get("official_rating")) else None,
+            "confidence": round(ew, 4),
+            "reason": " + ".join(reason_parts),
+        })
+
+    candidates.sort(key=lambda c: (c["confidence"], c["pct_gap"]), reverse=True)
+
+    seen_horses: set[str] = set()
+    top_4: list[dict] = []
+    for c in candidates:
+        if c["horse_name"] in seen_horses:
+            continue
+        seen_horses.add(c["horse_name"])
+        top_4.append(c)
+        if len(top_4) == 4:
+            break
+
+    picks = [BestBetRunner(**c) for c in top_4]
+
+    return BestBetsResponse(
+        date=target_date,
+        picks=picks,
+        total_races_scanned=len(race_ids),
+        timestamp=datetime.now().isoformat(),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Value betting & model monitoring endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/value-bets/{race_id}")
+def get_value_bets(race_id: int):
+    """Find value bets in a race by comparing model probs to market odds."""
+    try:
+        from ..value import compute_value_features, rank_value_bets
+        from ..models import load_model
+        import numpy as np
+
+        con = _get_con()
+        try:
+            features_df = build_features_for_races(con, [race_id])
+        finally:
+            con.close()
+
+        if features_df.empty:
+            return {"error": "No features for this race"}
+
+        win_model = load_model("win")
+        feature_names = win_model["feature_names"]
+        X = features_df.reindex(columns=feature_names).copy()
+        for col in X.columns:
+            X[col] = pd.to_numeric(X[col], errors="coerce")
+
+        win_probs = _predict_stacked(win_model, X, feature_names)
+
+        result_df = features_df[["horse_name"]].copy()
+        result_df["win_prob"] = win_probs
+
+        if "back_odds" in features_df.columns:
+            result_df["back_odds"] = features_df["back_odds"].values
+        else:
+            return {"bets": [], "message": "No market odds available"}
+
+        valued = compute_value_features(result_df)
+        top = rank_value_bets(valued)
+
+        bets = []
+        for _, row in top.iterrows():
+            bets.append({
+                "horse_name": row["horse_name"],
+                "win_prob": round(float(row["win_prob"]), 4),
+                "back_odds": float(row.get("back_odds", 0)),
+                "ev": round(float(row["ev"]), 4),
+                "value_score": round(float(row["value_score"]), 4),
+                "kelly": round(float(row["kelly"]), 4),
+                "recommended_stake_pct": round(float(row["recommended_stake_pct"]), 4),
+            })
+
+        return {"race_id": race_id, "bets": bets}
+
+    except Exception as e:
+        logger.warning(f"Value bets failed: {e}")
+        return {"error": str(e)}
+
+
+@app.get("/api/model-monitoring")
+def model_monitoring():
+    """Get model monitoring history and drift detection."""
+    try:
+        from ..online import load_monitoring_history
+        history = load_monitoring_history()
+        return {"history": history[-30:], "total_snapshots": len(history)}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/execution-log")
+def get_execution_log():
+    """Get the betting execution log."""
+    try:
+        from ..execution import EXECUTION_LOG_PATH
+        import json as _json
+        if EXECUTION_LOG_PATH.exists():
+            data = _json.loads(EXECUTION_LOG_PATH.read_text(encoding="utf-8"))
+            total_pnl = sum(b.get("pnl", 0) or 0 for b in data)
+            return {
+                "bets": data[-50:],
+                "total_bets": len(data),
+                "total_pnl": round(total_pnl, 2),
+            }
+        return {"bets": [], "total_bets": 0, "total_pnl": 0}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/pace-analysis/{race_id}")
+def get_pace_analysis(race_id: int):
+    """Get pace/race shape analysis for a specific race."""
+    try:
+        from ..pace import predict_race_shape
+
+        con = _get_con()
+        try:
+            features_df = build_features_for_races(con, [race_id])
+        finally:
+            con.close()
+
+        if features_df.empty:
+            return {"error": "No data for this race"}
+
+        styles = features_df["run_style"].tolist() if "run_style" in features_df.columns else []
+        names = features_df["horse_name"].tolist() if "horse_name" in features_df.columns else []
+
+        if styles:
+            analysis = predict_race_shape(styles, names)
+        else:
+            analysis = {"shape": "unknown", "narrative": "No run style data available"}
+
+        runners = []
+        for _, row in features_df.iterrows():
+            runner_info = {"horse_name": row.get("horse_name", "")}
+            if "run_style" in features_df.columns:
+                s = row.get("run_style")
+                style_map = {1.0: "Front Runner", 2.0: "Stalker", 3.0: "Closer"}
+                runner_info["run_style"] = style_map.get(s, "Unknown") if not pd.isna(s) else "Unknown"
+            if "pace_advantage" in features_df.columns:
+                pa = row.get("pace_advantage")
+                runner_info["pace_advantage"] = round(float(pa), 2) if not pd.isna(pa) else None
+            runners.append(runner_info)
+
+        return {"race_id": race_id, "analysis": analysis, "runners": runners}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+@app.get("/api/staking-calc")
+def staking_calculator(
+    prob: float = Query(..., description="Model probability"),
+    odds: float = Query(..., description="Decimal odds"),
+    bank: float = Query(1000, description="Current bank"),
+):
+    """Calculate optimal stake for a bet."""
+    try:
+        from ..staking import calculate_stake
+        rec = calculate_stake(prob, odds, bank)
+        return {
+            "model_prob": prob,
+            "decimal_odds": odds,
+            "kelly_full": rec.kelly_full,
+            "kelly_fractional": rec.kelly_fractional,
+            "stake_amount": rec.stake_amount,
+            "stake_pct": rec.stake_pct,
+            "ev": rec.ev,
+            "value_score": rec.value_score,
+            "confidence_tier": rec.confidence_tier,
+        }
+    except Exception as e:
+        return {"error": str(e)}
 
 
 # ---------------------------------------------------------------------------

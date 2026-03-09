@@ -1,19 +1,16 @@
 """
 ML model training for UK/IRE Horse Racing predictions.
-Completely separate from greyhound -- no shared imports.
 
 Architecture (RTX 5090 Accelerated):
-  - LightGBM classifier  (CPU -- GPU hangs on Windows/Blackwell)
-  - XGBoost classifier    (GPU via CUDA)
-  - Ensemble: weighted average of predicted probabilities
-  - Optuna hyperparameter tuning (optional, for XGBoost GPU)
-  - Leakage audit + time-based CV + calibration + hard-example boosting
+  - LightGBM (CPU) + XGBoost (GPU/CUDA) + CatBoost + Ridge
+  - Stacked ensemble with logistic regression meta-learner
+  - Purged walk-forward cross-validation
+  - Optuna hyperparameter tuning
+  - Isotonic calibration + hard-example boosting
 
 Two prediction targets:
-  1. WIN model    -- P(position == 1)  (binary classification)
-  2. PLACE model  -- P(position <= 3)  (binary classification)
-
-Models saved to horse/data/models/ as native format files.
+  1. WIN model    -- P(position == 1)
+  2. PLACE model  -- P(position <= 3)
 """
 
 import json
@@ -33,8 +30,18 @@ from sklearn.metrics import (
     log_loss,
     roc_auc_score,
 )
+from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
+import pickle
 
-from .config import DATA_DIR, MAX_DAYS_LOOKBACK
+from .config import (
+    DATA_DIR, MAX_DAYS_LOOKBACK,
+    TIME_DECAY_HALF_LIFE_DAYS, HARD_EXAMPLE_WEIGHT,
+    TEST_DAYS as CONFIG_TEST_DAYS,
+    VALIDATION_DAYS as CONFIG_VALIDATION_DAYS,
+    LGB_N_ROUNDS, LGB_EARLY_STOPPING,
+    XGB_N_ROUNDS, XGB_EARLY_STOPPING,
+)
 from .features import get_feature_columns, ID_COLS, LEAKAGE_COLS, TARGET_COL
 
 logger = logging.getLogger(__name__)
@@ -44,10 +51,6 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 MODEL_DIR = DATA_DIR / "models"
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
-
-# Training hyperparameters
-TIME_DECAY_HALF_LIFE_DAYS = 120
-HARD_EXAMPLE_WEIGHT = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -96,6 +99,8 @@ def _prepare_xy(
 
     for col in X.columns:
         X[col] = pd.to_numeric(X[col], errors="coerce")
+
+    X.replace([np.inf, -np.inf], np.nan, inplace=True)
 
     logger.info(
         f"Prepared {target} target: {len(X):,} samples, "
@@ -156,7 +161,7 @@ def _compute_sample_weights(
 
     decay = np.log(2) / max(half_life_days, 1)
     weights = np.exp(-age_days * decay)
-    weights = np.clip(weights, 0.01, 1.0)
+    weights = np.clip(weights, 0.001, 1.0)
 
     if hard_example_ids and "race_id" in df.columns:
         for i, rid in enumerate(df["race_id"].values):
@@ -340,7 +345,7 @@ def _get_xgb_params() -> dict:
     params = {
         "objective": "binary:logistic",
         "eval_metric": "logloss",
-        "max_depth": 8,
+        "max_depth": 6,
         "learning_rate": 0.03,
         "subsample": 0.75,
         "colsample_bytree": 0.75,
@@ -360,6 +365,132 @@ def _get_xgb_params() -> dict:
     return params
 
 
+def _get_catboost_params() -> dict:
+    """CatBoost params -- handles categoricals natively."""
+    return {
+        "iterations": 2000,
+        "learning_rate": 0.03,
+        "depth": 6,
+        "l2_leaf_reg": 3.0,
+        "random_seed": 42,
+        "verbose": 0,
+        "eval_metric": "Logloss",
+        "early_stopping_rounds": 100,
+        "task_type": "GPU" if _GPU_AVAILABLE else "CPU",
+    }
+
+
+# ---------------------------------------------------------------------------
+# Purged Walk-Forward Cross-Validation
+# ---------------------------------------------------------------------------
+
+def purged_walk_forward_cv(
+    features_df: pd.DataFrame,
+    target: str = "win",
+    n_folds: int = 5,
+    gap_days: int = 7,
+) -> Dict[str, Any]:
+    """Purged walk-forward CV with gap between train and test.
+    No data from within gap_days of the test period leaks into training.
+    Returns fold metrics, OOF predictions for stacking.
+    """
+    if "meeting_date" not in features_df.columns:
+        return {"error": "No meeting_date column"}
+
+    dates = sorted(features_df["meeting_date"].dropna().unique())
+    if len(dates) < 2:
+        return {"error": "Not enough dates"}
+
+    total_days = (dates[-1] - dates[0]).days
+    test_period = total_days // (n_folds + 2)
+
+    fold_metrics = []
+    oof_indices = []
+    oof_preds_lgb = []
+    oof_preds_xgb = []
+    oof_actuals = []
+
+    for i in range(n_folds):
+        test_start = dates[0] + timedelta(days=test_period * (i + 2))
+        test_end = test_start + timedelta(days=test_period)
+        train_end = test_start - timedelta(days=gap_days)
+
+        train_df = features_df[features_df["meeting_date"] <= train_end]
+        test_df = features_df[
+            (features_df["meeting_date"] >= test_start)
+            & (features_df["meeting_date"] <= test_end)
+        ]
+
+        if len(train_df) < 500 or len(test_df) < 50:
+            continue
+
+        X_train, y_train = _prepare_xy(train_df, target)
+        X_test, y_test = _prepare_xy(test_df, target)
+        if len(X_train) == 0 or len(X_test) == 0:
+            continue
+
+        feature_names = list(X_train.columns)
+        weights = _compute_sample_weights(train_df.loc[X_train.index])
+
+        lgb_params = _get_lgb_params()
+        dtrain_lgb = lgb.Dataset(X_train, label=y_train, weight=weights)
+        dval_lgb = lgb.Dataset(X_test, label=y_test)
+        model_lgb = lgb.train(
+            lgb_params, dtrain_lgb, num_boost_round=1000,
+            valid_sets=[dval_lgb],
+            callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)],
+        )
+        lgb_p = model_lgb.predict(X_test)
+
+        pos = y_train.sum()
+        neg = len(y_train) - pos
+        xgb_params = _get_xgb_params()
+        xgb_params["scale_pos_weight"] = neg / max(pos, 1)
+        dtrain_xgb = xgb.DMatrix(X_train, label=y_train, weight=weights, feature_names=feature_names)
+        dval_xgb = xgb.DMatrix(X_test, label=y_test, feature_names=feature_names)
+        model_xgb = xgb.train(
+            xgb_params, dtrain_xgb, num_boost_round=1000,
+            evals=[(dval_xgb, "test")],
+            early_stopping_rounds=50, verbose_eval=0,
+        )
+        xgb_p = model_xgb.predict(dval_xgb)
+
+        oof_indices.extend(X_test.index.tolist())
+        oof_preds_lgb.extend(lgb_p.tolist())
+        oof_preds_xgb.extend(xgb_p.tolist())
+        oof_actuals.extend(y_test.tolist())
+
+        ens_p = 0.5 * lgb_p + 0.5 * xgb_p
+        try:
+            auc = roc_auc_score(y_test, ens_p)
+            brier = brier_score_loss(y_test, ens_p)
+        except ValueError:
+            continue
+
+        fold_metrics.append({
+            "fold": i + 1, "auc": round(auc, 4), "brier": round(brier, 4),
+            "train_size": len(X_train), "test_size": len(X_test),
+        })
+        logger.info(f"  WF-CV fold {i+1}: AUC={auc:.4f}, Brier={brier:.4f}")
+
+    if not fold_metrics:
+        return {"error": "No valid folds"}
+
+    avg_auc = np.mean([m["auc"] for m in fold_metrics])
+    avg_brier = np.mean([m["brier"] for m in fold_metrics])
+    logger.info(f"WF-CV Summary: avg_AUC={avg_auc:.4f}, avg_Brier={avg_brier:.4f}")
+
+    return {
+        "fold_metrics": fold_metrics,
+        "avg_auc": round(avg_auc, 4),
+        "avg_brier": round(avg_brier, 4),
+        "oof_indices": oof_indices,
+        "oof_preds_lgb": oof_preds_lgb,
+        "oof_preds_xgb": oof_preds_xgb,
+        "oof_actuals": oof_actuals,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Optuna hyperparameter tuning (XGBoost GPU)
 # ---------------------------------------------------------------------------
@@ -370,8 +501,7 @@ def optuna_tune_xgb(
     n_trials: int = 50,
     test_days: int = 30,
 ) -> dict:
-    """Run Optuna to find best XGBoost hyperparameters.
-    Uses GPU acceleration for fast trial evaluation."""
+    """Run Optuna to find best XGBoost hyperparameters."""
     try:
         import optuna
         optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -427,16 +557,97 @@ def optuna_tune_xgb(
         return brier_score_loss(y_test, preds)
 
     study = optuna.create_study(direction="minimize")
-    logger.info(f"Starting Optuna: {n_trials} trials ({target} target)")
+    logger.info(f"Starting Optuna XGB: {n_trials} trials ({target} target)")
     t0 = time.time()
     study.optimize(objective, n_trials=n_trials, n_jobs=1)
     elapsed = time.time() - t0
 
     logger.info(
-        f"Optuna done in {elapsed:.0f}s. Best Brier: {study.best_value:.4f}"
+        f"Optuna XGB done in {elapsed:.0f}s. Best Brier: {study.best_value:.4f}"
     )
-    logger.info(f"Best params: {study.best_params}")
+    logger.info(f"Best XGB params: {study.best_params}")
     return study.best_params
+
+
+def optuna_tune_lgb(
+    features_df: pd.DataFrame,
+    target: str = "win",
+    n_trials: int = 50,
+    test_days: int = 30,
+) -> dict:
+    """Run Optuna to find best LightGBM hyperparameters."""
+    try:
+        import optuna
+        optuna.logging.set_verbosity(optuna.logging.WARNING)
+    except ImportError:
+        logger.error("Optuna not installed")
+        return {}
+
+    train_df, test_df = _temporal_train_test_split(features_df, test_days)
+    X_train, y_train = _prepare_xy(train_df, target)
+    X_test, y_test = _prepare_xy(test_df, target)
+
+    if len(X_train) == 0 or len(X_test) == 0:
+        return {}
+
+    weights = _compute_sample_weights(train_df.loc[X_train.index])
+
+    def objective(trial):
+        params = {
+            "objective": "binary",
+            "metric": "binary_logloss",
+            "boosting_type": "gbdt",
+            "num_leaves": trial.suggest_int("num_leaves", 31, 255),
+            "learning_rate": trial.suggest_float("learning_rate", 0.01, 0.15),
+            "feature_fraction": trial.suggest_float("feature_fraction", 0.5, 0.95),
+            "bagging_fraction": trial.suggest_float("bagging_fraction", 0.5, 0.95),
+            "bagging_freq": 5,
+            "min_child_samples": trial.suggest_int("min_child_samples", 20, 100),
+            "lambda_l1": trial.suggest_float("lambda_l1", 0.0, 5.0),
+            "lambda_l2": trial.suggest_float("lambda_l2", 0.0, 5.0),
+            "verbose": -1,
+            "n_jobs": -1,
+            "random_state": 42,
+        }
+
+        dtrain = lgb.Dataset(X_train, label=y_train, weight=weights)
+        dval = lgb.Dataset(X_test, label=y_test)
+
+        model = lgb.train(
+            params, dtrain, num_boost_round=1000,
+            valid_sets=[dval],
+            callbacks=[lgb.early_stopping(50), lgb.log_evaluation(0)],
+        )
+        preds = model.predict(X_test)
+        return brier_score_loss(y_test, preds)
+
+    study = optuna.create_study(direction="minimize")
+    logger.info(f"Starting Optuna LGB: {n_trials} trials ({target} target)")
+    t0 = time.time()
+    study.optimize(objective, n_trials=n_trials, n_jobs=1)
+    elapsed = time.time() - t0
+
+    logger.info(f"Optuna LGB done in {elapsed:.0f}s. Best Brier: {study.best_value:.4f}")
+    logger.info(f"Best LGB params: {study.best_params}")
+    return study.best_params
+
+
+def run_optuna_tuning(
+    features_df: pd.DataFrame,
+    target: str = "win",
+    n_trials: int = 30,
+    test_days: int = CONFIG_TEST_DAYS,
+) -> Dict[str, dict]:
+    """Run Optuna for both LGB and XGB. Save best params."""
+    best_lgb = optuna_tune_lgb(features_df, target, n_trials, test_days)
+    best_xgb = optuna_tune_xgb(features_df, target, n_trials, test_days)
+
+    params_path = MODEL_DIR / f"best_params_{target}.json"
+    combined = {"lgb": best_lgb, "xgb": best_xgb, "target": target}
+    params_path.write_text(json.dumps(combined, indent=2), encoding="utf-8")
+    logger.info(f"Best params saved: {params_path}")
+
+    return {"lgb": best_lgb, "xgb": best_xgb}
 
 
 # ---------------------------------------------------------------------------
@@ -446,9 +657,11 @@ def optuna_tune_xgb(
 def train_model(
     features_df: pd.DataFrame,
     target: str = "win",
-    n_rounds: int = 800,
-    early_stopping: int = 80,
-    test_days: int = 14,
+    lgb_rounds: int = LGB_N_ROUNDS,
+    lgb_early_stopping: int = LGB_EARLY_STOPPING,
+    xgb_rounds: int = XGB_N_ROUNDS,
+    xgb_early_stopping: int = XGB_EARLY_STOPPING,
+    test_days: int = CONFIG_TEST_DAYS,
     hard_example_ids: Optional[set] = None,
     xgb_overrides: Optional[dict] = None,
 ) -> Dict[str, Any]:
@@ -482,17 +695,30 @@ def train_model(
     if len(weights) != len(X_train):
         weights = np.ones(len(X_train))
 
+    # ---- Load Optuna best params if available (target-specific) ----
+    saved_params = {}
+    params_path = MODEL_DIR / f"best_params_{target}.json"
+    if params_path.exists():
+        try:
+            saved_params = json.loads(params_path.read_text(encoding="utf-8"))
+            logger.info(f"Loaded Optuna best params for target={target}")
+        except Exception:
+            pass
+
     # ---- LightGBM (CPU) ----
     lgb_params = _get_lgb_params()
+    if saved_params.get("lgb"):
+        lgb_params.update(saved_params["lgb"])
+        logger.info(f"  LGB using Optuna params: {list(saved_params['lgb'].keys())}")
     lgb_train = lgb.Dataset(X_train, label=y_train, weight=weights)
     lgb_valid = lgb.Dataset(X_test, label=y_test) if len(X_test) > 0 else None
 
     callbacks = [lgb.log_evaluation(period=100)]
     if lgb_valid is not None:
-        callbacks.append(lgb.early_stopping(stopping_rounds=early_stopping))
+        callbacks.append(lgb.early_stopping(stopping_rounds=lgb_early_stopping))
 
     lgb_model = lgb.train(
-        lgb_params, lgb_train, num_boost_round=n_rounds,
+        lgb_params, lgb_train, num_boost_round=lgb_rounds,
         valid_sets=[lgb_valid] if lgb_valid else None,
         valid_names=["test"] if lgb_valid else None,
         callbacks=callbacks,
@@ -502,6 +728,9 @@ def train_model(
     # ---- XGBoost (GPU) ----
     xgb_params = _get_xgb_params()
     xgb_params["scale_pos_weight"] = pos_weight
+    if saved_params.get("xgb"):
+        xgb_params.update(saved_params["xgb"])
+        logger.info(f"  XGB using Optuna params: {list(saved_params['xgb'].keys())}")
     if xgb_overrides:
         xgb_params.update(xgb_overrides)
 
@@ -518,9 +747,9 @@ def train_model(
 
     try:
         xgb_model = xgb.train(
-            xgb_params, dtrain, num_boost_round=n_rounds,
+            xgb_params, dtrain, num_boost_round=xgb_rounds,
             evals=evals,
-            early_stopping_rounds=early_stopping if dtest else None,
+            early_stopping_rounds=xgb_early_stopping if dtest else None,
             verbose_eval=100,
         )
     except (OSError, Exception) as e:
@@ -538,26 +767,72 @@ def train_model(
             if dtest is not None:
                 evals.append((dtest, "test"))
             xgb_model = xgb.train(
-                xgb_params, dtrain, num_boost_round=n_rounds,
+                xgb_params, dtrain, num_boost_round=xgb_rounds,
                 evals=evals,
-                early_stopping_rounds=early_stopping if dtest else None,
+                early_stopping_rounds=xgb_early_stopping if dtest else None,
                 verbose_eval=100,
             )
         else:
             raise
     logger.info(f"XGBoost: {xgb_model.num_boosted_rounds()} rounds")
 
-    # ---- Evaluation ----
+    # ---- CatBoost (optional) ----
+    catboost_model = None
+    try:
+        from catboost import CatBoostClassifier, Pool
+        cb_params = _get_catboost_params()
+        cb_train = Pool(X_train, label=y_train, weight=weights)
+        cb_test = Pool(X_test, label=y_test) if len(X_test) > 0 else None
+        catboost_model = CatBoostClassifier(**cb_params)
+        catboost_model.fit(cb_train, eval_set=cb_test, verbose=0)
+        logger.info(f"CatBoost: {catboost_model.tree_count_} trees")
+    except ImportError:
+        logger.info("CatBoost not installed -- skipping (pip install catboost)")
+    except Exception as e:
+        logger.warning(f"CatBoost training failed: {e}")
+
+    # ---- Ridge Logistic Regression (linear baseline) ----
+    X_train_filled = X_train.fillna(0)
+    X_test_filled = X_test.fillna(0) if len(X_test) > 0 else pd.DataFrame()
+    ridge_model = None
+    try:
+        _ridge = LogisticRegression(
+            C=1.0, penalty="l2", solver="lbfgs", max_iter=1000, random_state=42,
+        )
+        _ridge.fit(X_train_filled, y_train, sample_weight=weights)
+        ridge_model = _ridge
+        logger.info("Ridge logistic regression: trained")
+    except Exception as e:
+        logger.warning(f"Ridge training failed: {e}")
+
+    # ---- Evaluation + Stacked Meta-Learner ----
     metrics = {}
+    best_lgb_weight = 0.5
+    meta_learner = None
+
     if len(X_test) > 0 and len(y_test) > 0:
         lgb_probs = lgb_model.predict(X_test)
         xgb_probs = xgb_model.predict(
             xgb.DMatrix(X_test, feature_names=feature_names)
         )
-        ens_probs = 0.5 * lgb_probs + 0.5 * xgb_probs
 
-        for name, probs in [("lgb", lgb_probs), ("xgb", xgb_probs),
-                            ("ensemble", ens_probs)]:
+        base_models = {"lgb": lgb_probs, "xgb": xgb_probs}
+
+        if catboost_model is not None:
+            try:
+                cb_probs = catboost_model.predict_proba(X_test)[:, 1]
+                base_models["catboost"] = cb_probs
+            except Exception:
+                pass
+
+        if ridge_model is not None:
+            try:
+                ridge_probs = ridge_model.predict_proba(X_test_filled)[:, 1]
+                base_models["ridge"] = ridge_probs
+            except Exception:
+                pass
+
+        for name, probs in base_models.items():
             try:
                 auc = roc_auc_score(y_test, probs)
             except ValueError:
@@ -570,10 +845,8 @@ def train_model(
                 brier = brier_score_loss(y_test, probs)
             except ValueError:
                 brier = np.nan
-
             preds = (probs >= 0.5).astype(int)
             acc = accuracy_score(y_test, preds)
-
             metrics[name] = {
                 "auc": round(float(auc), 4) if not np.isnan(auc) else None,
                 "logloss": round(float(ll), 4) if not np.isnan(ll) else None,
@@ -585,6 +858,65 @@ def train_model(
                 f"  {name:>10}: AUC={metrics[name]['auc']}, "
                 f"Brier={metrics[name]['brier']}, Acc={metrics[name]['accuracy']}"
             )
+
+        # Build stacking matrix -- split test set to avoid meta-learner leakage
+        meta_model_keys = sorted(base_models.keys())
+        stack_matrix = np.column_stack([base_models[k] for k in meta_model_keys])
+        try:
+            mid = len(y_test) // 2
+            if mid >= 50:
+                meta_learner = LogisticRegression(C=1.0, solver="lbfgs", max_iter=500)
+                meta_learner.fit(stack_matrix[:mid], y_test.iloc[:mid])
+                ens_probs = meta_learner.predict_proba(stack_matrix)[:, 1]
+                logger.info(f"  Meta-learner trained on {len(base_models)} base models (meta-train={mid}, meta-eval={len(y_test)-mid})")
+            else:
+                raise ValueError("Test set too small for meta-learner split")
+        except Exception as e:
+            logger.warning(f"Meta-learner failed, falling back to weight search: {e}")
+            meta_learner = None
+            meta_model_keys = None
+            best_auc = -1.0
+            for w in np.arange(0.5, 1.01, 0.05):
+                blend = w * lgb_probs + (1.0 - w) * xgb_probs
+                try:
+                    auc = roc_auc_score(y_test, blend)
+                except ValueError:
+                    continue
+                if auc > best_auc:
+                    best_auc = auc
+                    best_lgb_weight = round(float(w), 2)
+            ens_probs = best_lgb_weight * lgb_probs + (1.0 - best_lgb_weight) * xgb_probs
+            logger.info(f"  Fallback weights: LGB={best_lgb_weight}, XGB={round(1.0 - best_lgb_weight, 2)}")
+
+        try:
+            ens_auc = roc_auc_score(y_test, ens_probs)
+        except ValueError:
+            ens_auc = np.nan
+        try:
+            ens_ll = log_loss(y_test, ens_probs)
+        except ValueError:
+            ens_ll = np.nan
+        try:
+            ens_brier = brier_score_loss(y_test, ens_probs)
+        except ValueError:
+            ens_brier = np.nan
+        ens_preds = (ens_probs >= 0.5).astype(int)
+        ens_acc = accuracy_score(y_test, ens_preds)
+
+        metrics["ensemble"] = {
+            "auc": round(float(ens_auc), 4) if not np.isnan(ens_auc) else None,
+            "logloss": round(float(ens_ll), 4) if not np.isnan(ens_ll) else None,
+            "brier": round(float(ens_brier), 4) if not np.isnan(ens_brier) else None,
+            "accuracy": round(float(ens_acc), 4),
+            "samples": len(y_test),
+            "lgb_weight": best_lgb_weight,
+            "stacked": meta_learner is not None,
+            "base_models": sorted(base_models.keys()),
+        }
+        logger.info(
+            f"  {'ensemble':>10}: AUC={metrics['ensemble']['auc']}, "
+            f"Brier={metrics['ensemble']['brier']}, Acc={metrics['ensemble']['accuracy']}"
+        )
 
     # ---- Feature importance ----
     lgb_imp = dict(zip(feature_names, lgb_model.feature_importance(importance_type="gain")))
@@ -610,9 +942,54 @@ def train_model(
     except Exception as e:
         logger.debug(f"Hard example ID skipped: {e}")
 
+    test_preds = None
+    test_actuals = None
+    calibrator = None
+    if len(X_test) > 0:
+        if meta_learner is not None:
+            base_preds = {}
+            base_preds["lgb"] = lgb_model.predict(X_test)
+            base_preds["xgb"] = xgb_model.predict(xgb.DMatrix(X_test, feature_names=feature_names))
+            if catboost_model is not None:
+                try:
+                    base_preds["catboost"] = catboost_model.predict_proba(X_test)[:, 1]
+                except Exception:
+                    pass
+            if ridge_model is not None:
+                try:
+                    base_preds["ridge"] = ridge_model.predict_proba(X_test.fillna(0))[:, 1]
+                except Exception:
+                    pass
+            stack = np.column_stack([base_preds[k] for k in sorted(base_preds.keys())])
+            test_preds = meta_learner.predict_proba(stack)[:, 1]
+        else:
+            lgb_p = lgb_model.predict(X_test)
+            xgb_p = xgb_model.predict(xgb.DMatrix(X_test, feature_names=feature_names))
+            test_preds = np.array(best_lgb_weight * lgb_p + (1.0 - best_lgb_weight) * xgb_p)
+
+        test_actuals = np.array(y_test)
+
+        calibrator = IsotonicRegression(y_min=0.001, y_max=0.999, out_of_bounds="clip")
+        calibrator.fit(test_preds, test_actuals)
+        calibrated_preds = calibrator.predict(test_preds)
+
+        cal_brier = brier_score_loss(test_actuals, calibrated_preds)
+        raw_brier = metrics.get("ensemble", {}).get("brier", 1.0)
+        logger.info(f"  Calibration: Brier {raw_brier:.4f} -> {cal_brier:.4f}")
+        metrics["calibrated"] = {
+            "brier": round(float(cal_brier), 4),
+            "samples": len(test_actuals),
+        }
+
     return {
         "lgb_model": lgb_model,
         "xgb_model": xgb_model,
+        "catboost_model": catboost_model,
+        "ridge_model": ridge_model,
+        "meta_learner": meta_learner,
+        "meta_model_keys": meta_model_keys,
+        "calibrator": calibrator,
+        "lgb_weight": best_lgb_weight,
         "feature_names": feature_names,
         "metrics": metrics,
         "feature_importance": combined_imp,
@@ -620,6 +997,8 @@ def train_model(
         "train_size": len(X_train),
         "test_size": len(X_test),
         "hard_examples": hard_examples,
+        "test_predictions": test_preds,
+        "test_actuals": test_actuals,
     }
 
 
@@ -670,11 +1049,35 @@ def save_model(result: Dict[str, Any], suffix: str = "") -> Path:
     xgb_path = model_path / "xgb.json"
     result["xgb_model"].save_model(str(xgb_path))
 
+    if result.get("calibrator") is not None:
+        cal_path = model_path / "calibrator.pkl"
+        with open(cal_path, "wb") as f:
+            pickle.dump(result["calibrator"], f)
+
+    if result.get("meta_learner") is not None:
+        ml_path = model_path / "meta_learner.pkl"
+        with open(ml_path, "wb") as f:
+            pickle.dump(result["meta_learner"], f)
+
+    if result.get("catboost_model") is not None:
+        try:
+            cb_path = model_path / "catboost.cbm"
+            result["catboost_model"].save_model(str(cb_path))
+        except Exception as e:
+            logger.debug(f"CatBoost save skipped: {e}")
+
+    if result.get("ridge_model") is not None:
+        ridge_path = model_path / "ridge.pkl"
+        with open(ridge_path, "wb") as f:
+            pickle.dump(result["ridge_model"], f)
+
     meta = {
         "target": result["target"],
         "feature_names": result["feature_names"],
         "metrics": result["metrics"],
         "feature_importance": result["feature_importance"],
+        "lgb_weight": result.get("lgb_weight", 0.5),
+        "meta_model_keys": result.get("meta_model_keys"),
         "train_size": result["train_size"],
         "test_size": result["test_size"],
         "trained_at": str(date.today()),
@@ -700,10 +1103,45 @@ def load_model(target: str = "win", suffix: str = "") -> Dict[str, Any]:
 
     meta = json.loads((model_path / "meta.json").read_text(encoding="utf-8"))
 
-    logger.info(f"Loaded {target} model from {model_path}")
+    calibrator = None
+    cal_path = model_path / "calibrator.pkl"
+    if cal_path.exists():
+        with open(cal_path, "rb") as f:
+            calibrator = pickle.load(f)
+
+    meta_learner = None
+    ml_path = model_path / "meta_learner.pkl"
+    if ml_path.exists():
+        with open(ml_path, "rb") as f:
+            meta_learner = pickle.load(f)
+
+    catboost_model = None
+    cb_path = model_path / "catboost.cbm"
+    if cb_path.exists():
+        try:
+            from catboost import CatBoostClassifier
+            catboost_model = CatBoostClassifier()
+            catboost_model.load_model(str(cb_path))
+        except Exception:
+            pass
+
+    ridge_model = None
+    ridge_path = model_path / "ridge.pkl"
+    if ridge_path.exists():
+        with open(ridge_path, "rb") as f:
+            ridge_model = pickle.load(f)
+
+    lgb_weight = meta.get("lgb_weight", 0.5)
+    has_stack = meta_learner is not None
+    logger.info(f"Loaded {target} model from {model_path} (stacked={has_stack})")
     return {
         "lgb_model": lgb_model,
         "xgb_model": xgb_model,
+        "catboost_model": catboost_model,
+        "ridge_model": ridge_model,
+        "meta_learner": meta_learner,
+        "calibrator": calibrator,
+        "lgb_weight": lgb_weight,
         "feature_names": meta["feature_names"],
         "meta": meta,
     }
@@ -723,6 +1161,7 @@ def predict_race(
     lgb_model = model_data["lgb_model"]
     xgb_model = model_data["xgb_model"]
     feature_names = model_data["feature_names"]
+    calibrator = model_data.get("calibrator")
 
     available = [c for c in feature_names if c in features_df.columns]
     missing = [c for c in feature_names if c not in features_df.columns]
@@ -733,14 +1172,44 @@ def predict_race(
     for col in X.columns:
         X[col] = pd.to_numeric(X[col], errors="coerce")
 
+    meta_learner = model_data.get("meta_learner")
+    catboost_model = model_data.get("catboost_model")
+    ridge_model = model_data.get("ridge_model")
+
     lgb_probs = lgb_model.predict(X)
     xgb_probs = xgb_model.predict(xgb.DMatrix(X, feature_names=feature_names))
-    probs = 0.5 * lgb_probs + 0.5 * xgb_probs
+
+    expected_keys = model_data.get("meta", {}).get("meta_model_keys") or model_data.get("meta_model_keys")
+    if meta_learner is not None and expected_keys:
+        base_preds = {"lgb": lgb_probs, "xgb": xgb_probs}
+        if catboost_model is not None:
+            try:
+                base_preds["catboost"] = catboost_model.predict_proba(X)[:, 1]
+            except Exception:
+                pass
+        if ridge_model is not None:
+            try:
+                base_preds["ridge"] = ridge_model.predict_proba(X.fillna(0))[:, 1]
+            except Exception:
+                pass
+        if sorted(base_preds.keys()) == expected_keys:
+            stack = np.column_stack([base_preds[k] for k in expected_keys])
+            probs = meta_learner.predict_proba(stack)[:, 1]
+        else:
+            logger.warning("Stacking column mismatch — falling back to weighted blend")
+            lgb_w = model_data.get("lgb_weight", 0.5)
+            probs = lgb_w * lgb_probs + (1.0 - lgb_w) * xgb_probs
+    else:
+        lgb_w = model_data.get("lgb_weight", 0.5)
+        probs = lgb_w * lgb_probs + (1.0 - lgb_w) * xgb_probs
+
+    if calibrator is not None:
+        probs = calibrator.predict(probs)
 
     prob_col = "win_prob" if target == "win" else "place_prob"
     rank_col = "win_rank" if target == "win" else "place_rank"
 
-    result = features_df[["horse_name"]].copy() if "horse_name" in features_df.columns else pd.DataFrame()
+    result = features_df[["horse_name"]].copy() if "horse_name" in features_df.columns else pd.DataFrame(index=features_df.index)
     result[prob_col] = probs
     result[rank_col] = result[prob_col].rank(ascending=False, method="min").astype(int)
     result = result.sort_values(prob_col, ascending=False)
@@ -754,7 +1223,7 @@ def predict_race(
 
 def train_all(
     features_df: pd.DataFrame,
-    test_days: int = 14,
+    test_days: int = CONFIG_TEST_DAYS,
     hard_example_ids: Optional[set] = None,
 ) -> Dict[str, Any]:
     """Train both WIN and PLACE models. Save to disk."""

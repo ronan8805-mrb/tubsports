@@ -481,6 +481,51 @@ def _create_support_tables(con):
     """)
     con.execute("CREATE SEQUENCE IF NOT EXISTS seq_sentiment_id START 1")
 
+    # --- Execution log (automated betting) ---
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS execution_log (
+            bet_id          VARCHAR PRIMARY KEY,
+            race_id         INTEGER,
+            horse_name      VARCHAR NOT NULL,
+            predicted_prob  DOUBLE,
+            exchange_odds   DOUBLE,
+            value_score     DOUBLE,
+            kelly_fraction  DOUBLE,
+            stake           DOUBLE,
+            actual_odds_matched DOUBLE,
+            result          VARCHAR,
+            pnl             DOUBLE,
+            placed_at       TIMESTAMP DEFAULT current_timestamp
+        )
+    """)
+
+
+    # --- RacingTV / RaceiQ Sectional timing data ---
+    con.execute("""
+        CREATE TABLE IF NOT EXISTS sectionals (
+            sectional_id        INTEGER PRIMARY KEY,
+            race_id             INTEGER REFERENCES races(race_id),
+            result_id           INTEGER,
+            horse_name          VARCHAR NOT NULL,
+            api_horse_id        VARCHAR,
+            meeting_date        DATE NOT NULL,
+            course              VARCHAR NOT NULL,
+            finishing_speed_pct DOUBLE,
+            total_furlongs      INTEGER,
+            pos_at_2f           INTEGER,
+            pos_at_halfway      INTEGER,
+            gap_at_2f_secs      DOUBLE,
+            gap_at_halfway_secs DOUBLE,
+            early_split_avg     DOUBLE,
+            late_split_avg      DOUBLE,
+            pace_consistency    DOUBLE,
+            position_gain       INTEGER,
+            splits_json         VARCHAR,
+            scraped_at          TIMESTAMP DEFAULT current_timestamp,
+            UNIQUE (race_id, horse_name)
+        )
+    """)
+    con.execute("CREATE SEQUENCE IF NOT EXISTS seq_sectional_id START 1")
     # --- Predictions cache ---
     con.execute("""
         CREATE TABLE IF NOT EXISTS predictions (
@@ -518,6 +563,10 @@ def _create_indexes(con):
         ("idx_races_off_dt", "races", "off_dt"),
         ("idx_races_region", "races", "region_code"),
         ("idx_races_type", "races", "race_type"),
+        # Sectionals
+        ("idx_sectionals_race", "sectionals", "race_id"),
+        ("idx_sectionals_horse", "sectionals", "api_horse_id"),
+        ("idx_sectionals_date", "sectionals", "meeting_date"),
         # Form and ratings
         ("idx_horse_form_name", "horse_form", "horse_name"),
         ("idx_horse_form_date", "horse_form", "race_date"),

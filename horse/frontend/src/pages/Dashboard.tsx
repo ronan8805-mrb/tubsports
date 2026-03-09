@@ -1,71 +1,15 @@
-import { useState, useEffect, useRef, useCallback } from 'react';
+import { useState, useEffect } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { useQueryClient } from '@tanstack/react-query';
 import { useRaceCard, useAvailableDates } from '../hooks/useRaceCard';
-import { api } from '../services/api';
 
 type RegionFilter = 'ALL' | 'GB' | 'IE' | 'FR' | 'US' | 'AU' | 'HK' | 'JP' | 'INTL';
 
 export function Dashboard() {
   const navigate = useNavigate();
-  const queryClient = useQueryClient();
   const [searchParams, setSearchParams] = useSearchParams();
   const [selectedDate, setSelectedDate] = useState(searchParams.get('date') || '');
   const [selectedCourse, setSelectedCourse] = useState('');
   const [region, setRegion] = useState<RegionFilter>((searchParams.get('region') as RegionFilter) || 'ALL');
-
-  // Scrape state
-  const [scraping, setScraping] = useState(false);
-  const [scrapeMsg, setScrapeMsg] = useState<string | null>(null);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  const stopPolling = useCallback(() => {
-    if (pollRef.current) {
-      clearInterval(pollRef.current);
-      pollRef.current = null;
-    }
-  }, []);
-
-  const handleScrape = useCallback(async () => {
-    try {
-      setScraping(true);
-      setScrapeMsg(null);
-      const res = await api.triggerScrape();
-      if (res.status === 'already_running') {
-        setScrapeMsg('Already fetching...');
-      }
-      pollRef.current = setInterval(async () => {
-        try {
-          const status = await api.getScrapeStatus();
-          if (!status.running) {
-            stopPolling();
-            setScraping(false);
-            if (status.result === 'success') {
-              setScrapeMsg('New races loaded!');
-              queryClient.invalidateQueries({ queryKey: ['raceCard'] });
-              queryClient.invalidateQueries({ queryKey: ['dates'] });
-            } else {
-              setScrapeMsg(status.error ? `Error: ${status.error}` : 'Scrape finished');
-            }
-            setTimeout(() => setScrapeMsg(null), 5000);
-          }
-        } catch {
-          stopPolling();
-          setScraping(false);
-          setScrapeMsg('Failed to check status');
-          setTimeout(() => setScrapeMsg(null), 5000);
-        }
-      }, 3000);
-    } catch (err) {
-      setScraping(false);
-      setScrapeMsg(`Failed: ${err instanceof Error ? err.message : 'unknown error'}`);
-      setTimeout(() => setScrapeMsg(null), 5000);
-    }
-  }, [queryClient, stopPolling]);
-
-  useEffect(() => {
-    return () => stopPolling();
-  }, [stopPolling]);
 
   // Persist date & region in URL so they survive navigation
   useEffect(() => {
@@ -75,7 +19,7 @@ export function Dashboard() {
     setSearchParams(params, { replace: true });
   }, [selectedDate, region, setSearchParams]);
 
-  const { data: datesData } = useAvailableDates(5);
+  const { data: datesData } = useAvailableDates(30);
   const { data: cardData, isLoading, error } = useRaceCard(
     selectedDate || undefined,
     selectedCourse || undefined,
@@ -93,18 +37,65 @@ export function Dashboard() {
 
   const uniqueCourses = [...new Set(races.map((r) => r.course))];
 
+  const [monitoring, setMonitoring] = useState<any>(null);
+  useEffect(() => {
+    import('../services/api').then(({ api }) =>
+      api.getModelMonitoring().then(setMonitoring).catch(() => {})
+    );
+  }, []);
+
   return (
     <div className="max-w-7xl mx-auto px-4 py-6">
       {/* Header */}
       <div className="mb-6">
         <h1 className="text-2xl font-bold text-white mb-1">Race Card</h1>
         <p className="text-sm text-gray-500">
-          UK/IRE Horse Racing - 13D Predictive Intelligence
+          UK/IRE Horse Racing - Stacked ML Intelligence Platform
         </p>
       </div>
 
+      {/* Model Health Bar */}
+      {monitoring?.history?.length > 0 && (() => {
+        const latest = monitoring.history[monitoring.history.length - 1];
+        return (
+          <div className="mb-6 bg-gray-900 border border-gray-800 rounded-xl p-4">
+            <div className="flex items-center gap-4 flex-wrap">
+              <div className="flex items-center gap-2">
+                <span className={`w-2 h-2 rounded-full ${latest.auc == null ? 'bg-gray-500' : latest.auc >= 0.72 ? 'bg-emerald-500' : latest.auc >= 0.68 ? 'bg-amber-500' : 'bg-red-500'}`} />
+                <span className="text-xs text-gray-400">Model</span>
+              </div>
+              <div className="text-xs">
+                <span className="text-gray-500">AUC </span>
+                <span className="text-white font-mono">{latest.auc?.toFixed(4) ?? '—'}</span>
+              </div>
+              <div className="text-xs">
+                <span className="text-gray-500">Brier </span>
+                <span className="text-white font-mono">{latest.brier?.toFixed(4) ?? '—'}</span>
+              </div>
+              <div className="text-xs">
+                <span className="text-gray-500">Features </span>
+                <span className="text-white font-mono">{latest.feature_count ?? '—'}</span>
+              </div>
+              <div className="text-xs">
+                <span className="text-gray-500">Stacked </span>
+                <span className={`font-mono ${latest.stacked ? 'text-emerald-400' : 'text-gray-500'}`}>
+                  {latest.stacked ? 'Yes' : 'No'}
+                </span>
+              </div>
+              <div className="text-xs">
+                <span className="text-gray-500">Train </span>
+                <span className="text-white font-mono">{latest.train_size?.toLocaleString() ?? '—'}</span>
+              </div>
+              <div className="text-xs ml-auto">
+                <span className="text-gray-600">{latest.date}</span>
+              </div>
+            </div>
+          </div>
+        );
+      })()}
+
       {/* Filters */}
-      <div className="flex flex-wrap items-center gap-3 mb-6">
+      <div className="flex flex-wrap items-center gap-2 sm:gap-3 mb-6">
         {/* Date */}
         <select
           value={selectedDate}
@@ -158,48 +149,7 @@ export function Dashboard() {
         <span className="text-xs text-gray-500 ml-auto">
           {cardData?.total_races ?? 0} races
         </span>
-
-        {/* Fetch New Races button */}
-        <button
-          onClick={handleScrape}
-          disabled={scraping}
-          className={`inline-flex items-center gap-2 px-4 py-2 rounded-lg text-sm font-medium transition-all ${
-            scraping
-              ? 'bg-gray-700 text-gray-400 cursor-not-allowed'
-              : 'bg-emerald-600 hover:bg-emerald-500 text-white shadow-lg shadow-emerald-500/20'
-          }`}
-        >
-          {scraping ? (
-            <>
-              <svg className="w-4 h-4 animate-spin" viewBox="0 0 24 24" fill="none">
-                <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-              </svg>
-              Fetching...
-            </>
-          ) : (
-            <>
-              <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-              </svg>
-              Fetch New Races
-            </>
-          )}
-        </button>
       </div>
-
-      {/* Scrape status message */}
-      {scrapeMsg && (
-        <div className={`mb-4 px-4 py-2 rounded-lg text-sm font-medium ${
-          scrapeMsg.startsWith('Error') || scrapeMsg.startsWith('Failed')
-            ? 'bg-red-500/10 border border-red-500/30 text-red-400'
-            : scrapeMsg === 'New races loaded!'
-              ? 'bg-emerald-500/10 border border-emerald-500/30 text-emerald-400'
-              : 'bg-blue-500/10 border border-blue-500/30 text-blue-400'
-        }`}>
-          {scrapeMsg}
-        </div>
-      )}
 
       {/* Loading / Error */}
       {isLoading && (

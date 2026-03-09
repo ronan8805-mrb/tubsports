@@ -135,6 +135,27 @@ RACE_TYPES = {
 }
 
 # ---------------------------------------------------------------------------
+# Historical data storage
+# ---------------------------------------------------------------------------
+RAW_DIR = DATA_DIR / "raw"
+RESULTS_DIR = DATA_DIR / "results"
+
+# ---------------------------------------------------------------------------
+# Training config (15-year rolling window)
+# ---------------------------------------------------------------------------
+TRAIN_YEARS = 5
+TEST_DAYS = 30
+VALIDATION_DAYS = 60
+TIME_DECAY_HALF_LIFE_DAYS = 365
+HARD_EXAMPLE_WEIGHT = 2.0
+
+# LightGBM / XGBoost
+LGB_N_ROUNDS = 4000
+LGB_EARLY_STOPPING = 150
+XGB_N_ROUNDS = 4000
+XGB_EARLY_STOPPING = 150
+
+# ---------------------------------------------------------------------------
 # Model config
 # ---------------------------------------------------------------------------
 MAX_DAYS_LOOKBACK = 365

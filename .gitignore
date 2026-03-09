@@ -59,3 +59,29 @@ models/
 *.bak
 *.tmp
 .cache/
+
+# Horse data (large DB + model files)
+horse/data/*.duckdb
+horse/data/*.duckdb.wal
+horse/data/feature_cache/
+horse/data/feature_matrix.parquet
+horse/data/models/
+horse/data/results/
+horse/data/raw/
+
+# Large data files
+*.xlsx
+*.parquet
+
+# Temp scripts
+_create_user.py
+check_scrape.py
+fix_seq.py
+check_times.py
+patch_features.py
+scrape_all.py
+forensic.py
+test_api.py
+
+# Stray files
+=

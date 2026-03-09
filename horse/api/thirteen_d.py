@@ -86,7 +86,6 @@ DIMENSION_MAP = {
         "type_match_win_rate": 3.0,
         "class_match_win_rate": 2.0,
         "race_class_numeric": -1.5,
-        "handicap_flag": 0.5,
     },
     "History": {
         "form_avg_pos_6": -3.0,

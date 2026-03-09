@@ -7,11 +7,13 @@ echo   UK/IRE HORSE RACING AI - RETRAIN
 echo   RTX 5090 GPU Accelerated (XGBoost CUDA)
 echo ======================================================================
 echo.
-echo   LightGBM (CPU) + XGBoost (GPU) ensemble
-echo   ~120 features (form, jockey, trainer, breeding, draw, context)
-echo   Leakage audit + time-based CV + calibration
+echo   LGB + XGB + CatBoost + Ridge stacked ensemble
+echo   130+ features (breeding, NLP, pace, market, intent)
+echo   Purged walk-forward CV + isotonic calibration
 echo.
-echo   ESTIMATED TIME: ~5-15 minutes
+echo   --full-rebuild : Rebuild ALL features from scratch
+echo   --tune         : Run Optuna hyperparameter tuning
+echo   (default)      : Incremental - only new races
 echo.
 echo   Press any key to start...
 pause >nul
@@ -19,7 +21,12 @@ pause >nul
 cd /d "%~dp0"
 
 echo.
-echo [%TIME%] Starting horse model retrain...
+echo [%TIME%] Step 1: Data enrichment (damsire, ratings, courses, jockey/trainer stats)...
+echo.
+python -u -m horse.enrich
+
+echo.
+echo [%TIME%] Step 2: Model retrain...
 echo.
 python -u -m horse.retrain
 

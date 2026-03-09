@@ -170,6 +170,108 @@ export interface PredictionCount {
   races_predicted: number;
 }
 
+// Value betting
+export interface ValueBet {
+  horse_name: string;
+  win_prob: number;
+  back_odds: number;
+  ev: number;
+  value_score: number;
+  kelly: number;
+  recommended_stake_pct: number;
+}
+
+// Pace analysis
+export interface PaceAnalysis {
+  race_id: number;
+  analysis: {
+    shape: string;
+    narrative: string;
+    n_front_runners: number;
+    n_closers: number;
+    favoured_style: string;
+  };
+  runners: Array<{
+    horse_name: string;
+    run_style: string;
+    pace_advantage: number | null;
+  }>;
+}
+
+// Model monitoring
+export interface MonitoringSnapshot {
+  date: string;
+  auc: number | null;
+  brier: number | null;
+  feature_count: number;
+  train_size: number;
+  stacked: boolean;
+}
+
+export interface MonitoringData {
+  history: MonitoringSnapshot[];
+  total_snapshots: number;
+}
+
+// Execution log
+export interface ExecutionLog {
+  bets: Array<{
+    bet_id: string;
+    race_id: number;
+    horse_name: string;
+    predicted_prob: number;
+    exchange_odds: number;
+    value_score: number;
+    kelly_fraction: number;
+    stake: number;
+    result: string | null;
+    pnl: number | null;
+    placed_at: string;
+  }>;
+  total_bets: number;
+  total_pnl: number;
+}
+
+// Staking calculator
+export interface StakingResult {
+  model_prob: number;
+  decimal_odds: number;
+  kelly_full: number;
+  kelly_fractional: number;
+  stake_amount: number;
+  stake_pct: number;
+  ev: number;
+  value_score: number;
+  confidence_tier: string;
+}
+
+// Best Bets
+export interface BestBetRunner {
+  horse_name: string;
+  course: string;
+  race_time: string | null;
+  race_name: string | null;
+  race_id: number;
+  win_prob: number;
+  place_prob: number;
+  pct_gap: number;
+  fair_odds: number;
+  back_odds: number | null;
+  value_flag: string | null;
+  jockey: string | null;
+  trainer: string | null;
+  official_rating: number | null;
+  confidence: number;
+  reason: string;
+}
+
+export interface BestBetsResponse {
+  date: string;
+  picks: BestBetRunner[];
+  total_races_scanned: number;
+  timestamp: string;
+}
+
 // Scrape status
 
 export interface ScrapeStatus {
@@ -227,4 +329,24 @@ export const api = {
   },
 
   getOddsStatus: () => fetchJson<ScrapeStatus>('/odds-status'),
+
+  getValueBets: (raceId: number) =>
+    fetchJson<{ race_id: number; bets: ValueBet[] }>(`/value-bets/${raceId}`),
+
+  getPaceAnalysis: (raceId: number) =>
+    fetchJson<PaceAnalysis>(`/pace-analysis/${raceId}`),
+
+  getModelMonitoring: () =>
+    fetchJson<MonitoringData>('/model-monitoring'),
+
+  getExecutionLog: () =>
+    fetchJson<ExecutionLog>('/execution-log'),
+
+  getStakingCalc: (prob: number, odds: number, bank: number) =>
+    fetchJson<StakingResult>(`/staking-calc?prob=${prob}&odds=${odds}&bank=${bank}`),
+
+  getBestBets: (date?: string) => {
+    const qs = date ? `?date=${date}` : '';
+    return fetchJson<BestBetsResponse>(`/best-bets${qs}`);
+  },
 };
