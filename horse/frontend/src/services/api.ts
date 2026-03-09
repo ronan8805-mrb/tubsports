@@ -2,7 +2,8 @@
  * API service -- typed fetch wrappers for the Horse 13D backend.
  */
 
-const BASE = '/api';
+const RENDER_API = import.meta.env.VITE_API_URL || '';
+const BASE = RENDER_API ? `${RENDER_API}/api` : '/api';
 
 async function fetchJson<T>(path: string): Promise<T> {
   const res = await fetch(`${BASE}${path}`);

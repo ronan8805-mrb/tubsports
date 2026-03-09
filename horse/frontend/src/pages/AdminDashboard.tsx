@@ -2,6 +2,8 @@ import { useState, useEffect, useRef, useCallback } from 'react';
 import { useAuth } from '../contexts/AuthContext';
 import { api } from '../services/api';
 
+const API_BASE = import.meta.env.VITE_API_URL || '';
+
 interface UserInfo {
   user_id: number;
   username: string;
@@ -33,7 +35,7 @@ export function AdminDashboard() {
 
   const loadUsers = useCallback(async () => {
     try {
-      const res = await fetch('/api/auth/users', { headers: authHeader() });
+      const res = await fetch(`${API_BASE}/api/auth/users`, { headers: authHeader() });
       if (res.ok) setUsers(await res.json());
     } catch {}
   }, [authHeader]);
@@ -48,7 +50,7 @@ export function AdminDashboard() {
     setCreating(true);
     setMsg(null);
     try {
-      const res = await fetch('/api/auth/users', {
+      const res = await fetch(`${API_BASE}/api/auth/users`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json', ...authHeader() },
         body: JSON.stringify({ username: newUser, password: newPass, role: newRole }),
@@ -72,7 +74,7 @@ export function AdminDashboard() {
   const handleDelete = async (uid: number, uname: string) => {
     if (!confirm(`Delete user "${uname}"?`)) return;
     try {
-      const res = await fetch(`/api/auth/users/${uid}`, {
+      const res = await fetch(`${API_BASE}/api/auth/users/${uid}`, {
         method: 'DELETE',
         headers: authHeader(),
       });
@@ -102,7 +104,7 @@ export function AdminDashboard() {
     try {
       setScraping(true);
       setScrapeMsg(null);
-      const res = await fetch('/api/scrape-racecards', {
+      const res = await fetch(`${API_BASE}/api/scrape-racecards`, {
         method: 'POST',
         headers: authHeader(),
       });
@@ -135,7 +137,7 @@ export function AdminDashboard() {
     try {
       setRefreshingOdds(true);
       setOddsMsg(null);
-      const res = await fetch('/api/refresh-odds', {
+      const res = await fetch(`${API_BASE}/api/refresh-odds`, {
         method: 'POST',
         headers: authHeader(),
       });

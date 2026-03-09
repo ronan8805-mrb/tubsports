@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+duckdb
+pandas
+numpy
+lightgbm
+xgboost
+scikit-learn
+PyJWT
+python-dotenv
+requests
+tenacity
+beautifulsoup4
+openpyxl

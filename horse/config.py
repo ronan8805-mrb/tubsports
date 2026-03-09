@@ -12,7 +12,7 @@ from dotenv import load_dotenv
 # Paths
 # ---------------------------------------------------------------------------
 BASE_DIR = Path(__file__).resolve().parent
-DATA_DIR = BASE_DIR / "data"
+DATA_DIR = Path(os.environ.get("HORSE_DATA_DIR", str(BASE_DIR / "data")))
 DB_PATH = DATA_DIR / "horse.duckdb"
 MODELS_DIR = DATA_DIR / "models"
 
