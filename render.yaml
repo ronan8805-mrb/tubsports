@@ -6,7 +6,7 @@ services:
     startCommand: uvicorn horse.api.main:app --host 0.0.0.0 --port $PORT
     envVars:
       - key: PYTHON_VERSION
-        value: "3.11"
+        value: "3.11.7"
       - key: JWT_SECRET
         value: h0rs3-r4c1ng-13d-s3cr3t-k3y-2026
       - key: HORSE_DATA_DIR
