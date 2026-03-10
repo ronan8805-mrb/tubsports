@@ -21,17 +21,21 @@ const STORAGE_KEY = 'horse_auth';
 const API_BASE = import.meta.env.VITE_API_URL || '';
 
 async function getDeviceFingerprint(): Promise<string> {
-  const raw = [
-    navigator.userAgent,
-    screen.width,
-    screen.height,
-    screen.colorDepth,
-    Intl.DateTimeFormat().resolvedOptions().timeZone,
-    navigator.language,
-    navigator.hardwareConcurrency || 0,
-  ].join('|');
-  const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(raw));
-  return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+  try {
+    const raw = [
+      navigator.userAgent,
+      screen.width,
+      screen.height,
+      screen.colorDepth,
+      Intl.DateTimeFormat().resolvedOptions().timeZone,
+      navigator.language,
+      navigator.hardwareConcurrency || 0,
+    ].join('|');
+    const buf = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(raw));
+    return Array.from(new Uint8Array(buf)).map(b => b.toString(16).padStart(2, '0')).join('');
+  } catch {
+    return 'fallback-' + navigator.userAgent.slice(0, 32);
+  }
 }
 
 export function AuthProvider({ children }: { children: ReactNode }) {
