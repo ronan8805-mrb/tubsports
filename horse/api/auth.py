@@ -140,6 +140,7 @@ def ensure_users_table() -> None:
             con.execute("ALTER TABLE users ADD COLUMN device_hash VARCHAR")
         except Exception:
             pass
+        con.execute("CREATE SEQUENCE IF NOT EXISTS seq_security_id START 1")
         con.execute("""
             CREATE TABLE IF NOT EXISTS security_events (
                 event_id   INTEGER PRIMARY KEY DEFAULT nextval('seq_security_id'),
@@ -149,10 +150,6 @@ def ensure_users_table() -> None:
                 created_at TIMESTAMP DEFAULT current_timestamp
             )
         """)
-        try:
-            con.execute("CREATE SEQUENCE IF NOT EXISTS seq_security_id START 1")
-        except Exception:
-            pass
     finally:
         con.close()
 
