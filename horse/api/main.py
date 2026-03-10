@@ -51,45 +51,6 @@ from .thirteen_d import compute_thirteen_d_scores, compute_drivers
 logger = logging.getLogger(__name__)
 
 
-def _predict_stacked(model_data: dict, X, feature_names: list):
-    """Run weighted-average ensemble prediction."""
-    import numpy as np
-    import xgboost as xgb
-
-    lgb_probs = model_data["lgb_model"].predict(X)
-    xgb_probs = model_data["xgb_model"].predict(
-        xgb.DMatrix(X, feature_names=feature_names)
-    )
-
-    base_preds = {"lgb": lgb_probs, "xgb": xgb_probs}
-    cb = model_data.get("catboost_model")
-    if cb is not None:
-        try:
-            base_preds["catboost"] = cb.predict_proba(X)[:, 1]
-        except Exception:
-            pass
-    rf = model_data.get("rf_model")
-    if rf is not None:
-        try:
-            base_preds["rf"] = rf.predict_proba(X.fillna(0))[:, 1]
-        except Exception:
-            pass
-
-    ensemble_weights = model_data.get("ensemble_weights", {"lgb": 0.30, "xgb": 0.20, "catboost": 0.35, "rf": 0.15})
-    probs = np.zeros(len(X))
-    total_w = 0.0
-    for key, w in ensemble_weights.items():
-        if key in base_preds:
-            probs += w * base_preds[key]
-            total_w += w
-    if total_w > 0:
-        probs /= total_w
-
-    if model_data.get("calibrator") is not None:
-        probs = model_data["calibrator"].predict(probs)
-
-    return probs
-
 
 app = FastAPI(
     title="Horse Racing 13D Engine",
@@ -841,53 +802,44 @@ def get_best_bets(date: Optional[str] = Query(None, description="YYYY-MM-DD")):
 
 @app.get("/api/value-bets/{race_id}")
 def get_value_bets(race_id: int):
-    """Find value bets in a race by comparing model probs to market odds."""
+    """Value bets from pre-computed cache — no ML on server."""
     try:
-        from ..value import compute_value_features, rank_value_bets
-        from ..models import load_model
-        import numpy as np
-
         con = _get_con()
         try:
-            features_df = build_features_for_races(con, [race_id])
+            row = con.execute(
+                "SELECT m.meeting_date FROM races ra JOIN meetings m ON ra.meeting_id = m.meeting_id WHERE ra.race_id = ?",
+                [race_id],
+            ).fetchone()
         finally:
             con.close()
 
-        if features_df.empty:
-            return {"error": "No features for this race"}
+        if not row:
+            return {"error": "Race not found"}
 
-        win_model = load_model("win")
-        feature_names = win_model["feature_names"]
-        X = features_df.reindex(columns=feature_names).copy()
-        for col in X.columns:
-            X[col] = pd.to_numeric(X[col], errors="coerce")
+        cache = _load_cache(str(row[0]))
+        cached_race = cache.get("races", {}).get(str(race_id)) if cache else None
 
-        win_probs = _predict_stacked(win_model, X, feature_names)
-
-        result_df = features_df[["horse_name"]].copy()
-        result_df["win_prob"] = win_probs
-
-        if "back_odds" in features_df.columns:
-            result_df["back_odds"] = features_df["back_odds"].values
-        else:
-            return {"bets": [], "message": "No market odds available"}
-
-        valued = compute_value_features(result_df)
-        top = rank_value_bets(valued)
+        if not cached_race:
+            return {"bets": [], "message": "No pre-computed predictions. Run PUSH_PREDICTIONS.bat locally."}
 
         bets = []
-        for _, row in top.iterrows():
-            bets.append({
-                "horse_name": row["horse_name"],
-                "win_prob": round(float(row["win_prob"]), 4),
-                "back_odds": float(row.get("back_odds", 0)),
-                "ev": round(float(row["ev"]), 4),
-                "value_score": round(float(row["value_score"]), 4),
-                "kelly": round(float(row["kelly"]), 4),
-                "recommended_stake_pct": round(float(row["recommended_stake_pct"]), 4),
-            })
+        for r in cached_race.get("runners", []):
+            wp = r.get("win_prob", 0)
+            if wp > 0.05:
+                fair = 1.0 / max(wp, 0.001)
+                bets.append({
+                    "horse_name": r["horse_name"],
+                    "win_prob": round(wp, 4),
+                    "back_odds": 0,
+                    "fair_odds": round(fair, 2),
+                    "ev": 0,
+                    "value_score": round(wp, 4),
+                    "kelly": 0,
+                    "recommended_stake_pct": 0,
+                })
 
-        return {"race_id": race_id, "bets": bets}
+        bets.sort(key=lambda b: b["win_prob"], reverse=True)
+        return {"race_id": race_id, "bets": bets[:5]}
 
     except Exception as e:
         logger.warning(f"Value bets failed: {e}")
@@ -926,40 +878,32 @@ def get_execution_log():
 
 @app.get("/api/pace-analysis/{race_id}")
 def get_pace_analysis(race_id: int):
-    """Get pace/race shape analysis for a specific race."""
+    """Pace analysis — lightweight, no ML models needed."""
     try:
-        from ..pace import predict_race_shape
-
         con = _get_con()
         try:
-            features_df = build_features_for_races(con, [race_id])
+            row = con.execute(
+                "SELECT m.meeting_date FROM races ra JOIN meetings m ON ra.meeting_id = m.meeting_id WHERE ra.race_id = ?",
+                [race_id],
+            ).fetchone()
+
+            if not row:
+                return {"error": "Race not found"}
+
+            cache = _load_cache(str(row[0]))
+            cached_race = cache.get("races", {}).get(str(race_id)) if cache else None
+
+            if cached_race:
+                runners = [{"horse_name": r["horse_name"]} for r in cached_race.get("runners", [])]
+                return {
+                    "race_id": race_id,
+                    "analysis": {"shape": "pre-computed", "narrative": "Pace data available in race detail view."},
+                    "runners": runners,
+                }
+
+            return {"race_id": race_id, "analysis": {"shape": "unknown", "narrative": "No pace data available"}, "runners": []}
         finally:
             con.close()
-
-        if features_df.empty:
-            return {"error": "No data for this race"}
-
-        styles = features_df["run_style"].tolist() if "run_style" in features_df.columns else []
-        names = features_df["horse_name"].tolist() if "horse_name" in features_df.columns else []
-
-        if styles:
-            analysis = predict_race_shape(styles, names)
-        else:
-            analysis = {"shape": "unknown", "narrative": "No run style data available"}
-
-        runners = []
-        for _, row in features_df.iterrows():
-            runner_info = {"horse_name": row.get("horse_name", "")}
-            if "run_style" in features_df.columns:
-                s = row.get("run_style")
-                style_map = {1.0: "Front Runner", 2.0: "Stalker", 3.0: "Closer"}
-                runner_info["run_style"] = style_map.get(s, "Unknown") if not pd.isna(s) else "Unknown"
-            if "pace_advantage" in features_df.columns:
-                pa = row.get("pace_advantage")
-                runner_info["pace_advantage"] = round(float(pa), 2) if not pd.isna(pa) else None
-            runners.append(runner_info)
-
-        return {"race_id": race_id, "analysis": analysis, "runners": runners}
     except Exception as e:
         return {"error": str(e)}
 
