@@ -61,9 +61,21 @@ echo [%TIME%] Step 7: Running model monitoring...
 python -u -c "from horse.online import load_monitoring_history; h=load_monitoring_history(); print(f'  Monitoring: {len(h)} snapshots recorded')" 2>nul
 if errorlevel 1 echo [%TIME%] WARNING: Monitoring check had errors
 
-:: ---- Step 8: Refresh odds for tomorrow ----
+:: ---- Step 8: Pre-compute predictions for tomorrow ----
 echo.
-echo [%TIME%] Step 8: Refreshing odds for upcoming races...
+echo [%TIME%] Step 8: Pre-computing predictions for tomorrow...
+python -u -m horse.precompute
+if errorlevel 1 echo [%TIME%] WARNING: Precompute had errors
+
+:: ---- Step 9: Upload predictions cache to Render ----
+echo.
+echo [%TIME%] Step 9: Uploading predictions to Render...
+scp -r horse/data/predictions_cache srv-d6nh2p5m5p6s73ct5920@ssh.oregon.render.com:/var/data/horse/ 2>nul
+if errorlevel 1 echo [%TIME%] WARNING: Render upload failed (run manually from Git Bash)
+
+:: ---- Step 10: Refresh odds ----
+echo.
+echo [%TIME%] Step 10: Refreshing odds for upcoming races...
 python -u -c "import requests; r=requests.post('http://localhost:8002/api/refresh-odds', timeout=5); print(f'  Odds refresh: {r.json()}')" 2>nul
 if errorlevel 1 echo [%TIME%] INFO: Odds refresh skipped (API may not be running)
 
@@ -72,7 +84,7 @@ if %ERRORLEVEL% EQU 0 (
     color 0A
     echo ======================================================================
     echo   NIGHTLY CYCLE COMPLETE - %DATE% %TIME%
-    echo   Stacked model retrained. Drift monitored. Odds persisted.
+    echo   Models retrained. Predictions cached. Uploaded to Render.
     echo ======================================================================
 ) else (
     color 0C

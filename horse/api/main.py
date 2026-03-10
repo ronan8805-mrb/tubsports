@@ -15,10 +15,24 @@ from fastapi import Depends, FastAPI, HTTPException, Query
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from ..config import API_PORT, DB_PATH
+import json
+
+from ..config import API_PORT, DATA_DIR, DB_PATH
 from ..db import get_connection, get_db_stats, init_database
 from ..features import build_features_for_races, get_feature_columns
 from ..prediction_db import get_pred_connection
+
+PREDICTIONS_CACHE_DIR = DATA_DIR / "predictions_cache"
+
+
+def _load_cache(target_date: str) -> dict | None:
+    cache_path = PREDICTIONS_CACHE_DIR / f"{target_date}.json"
+    if cache_path.exists():
+        try:
+            return json.loads(cache_path.read_text(encoding="utf-8"))
+        except Exception:
+            pass
+    return None
 from .auth import router as auth_router, ensure_users_table, seed_admin, require_admin, get_current_user
 from .schemas import (
     BestBetRunner,
@@ -287,11 +301,12 @@ def get_thirteen_d(race_id: int):
         if not race_row:
             raise HTTPException(status_code=404, detail=f"Race {race_id} not found")
 
-        api_race_id = race_row[13]  # from ra.api_race_id
+        api_race_id = race_row[13]
+        meeting_date = str(race_row[1])
 
         race_info = RaceInfo(
             race_id=race_row[0],
-            meeting_date=str(race_row[1]),
+            meeting_date=meeting_date,
             course=race_row[2] or "",
             race_number=race_row[3],
             race_name=race_row[4],
@@ -305,56 +320,89 @@ def get_thirteen_d(race_id: int):
             region_code=race_row[12],
         )
 
+        # Try pre-computed cache first (no heavy ML on server)
+        cache = _load_cache(meeting_date)
+        cached_race = cache.get("races", {}).get(str(race_id)) if cache else None
+
+        if cached_race:
+            cached_runners = cached_race.get("runners", [])
+            runner_api_ids = cached_race.get("runner_api_ids", {})
+
+            jt_rows = con.execute("""
+                SELECT horse_name, jockey_name, trainer_name, api_horse_id, silk_url
+                FROM results WHERE race_id = ?
+            """, [race_id]).fetchall()
+            jt_map = {r[0]: (r[1], r[2], r[4]) for r in jt_rows}
+
+            runners = []
+            for cr in cached_runners:
+                dims = cr.get("dimensions", {})
+                dim_list = []
+                if isinstance(dims, dict):
+                    dim_list = [DimensionScore(name=k, score=v.get("score", 5), label=v.get("label", ""),
+                                               detail=v.get("detail", "")) for k, v in dims.items()]
+                elif isinstance(dims, list):
+                    dim_list = [DimensionScore(**d) for d in dims]
+
+                jt = jt_map.get(cr["horse_name"], (None, None, None))
+                runners.append(RunnerPrediction(
+                    horse_name=cr["horse_name"],
+                    draw=None,
+                    jockey=jt[0],
+                    trainer=jt[1],
+                    silk_url=jt[2] if len(jt) > 2 else None,
+                    age=None,
+                    weight_lbs=None,
+                    official_rating=cr.get("official_rating"),
+                    win_prob=cr.get("win_prob", 0),
+                    place_prob=cr.get("place_prob", 0),
+                    win_rank=0,
+                    place_rank=0,
+                    fair_odds=round(1.0 / max(cr.get("win_prob", 0.001), 0.001), 2),
+                    dimensions=dim_list,
+                    positive_drivers=[],
+                    negative_drivers=[],
+                ))
+
+            runners.sort(key=lambda r: r.win_prob, reverse=True)
+            for i, r in enumerate(runners):
+                r.win_rank = i + 1
+            runners_by_place = sorted(runners, key=lambda r: r.place_prob, reverse=True)
+            for i, r in enumerate(runners_by_place):
+                r.place_rank = i + 1
+
+            _attach_odds(race_id, runners, api_race_id, runner_api_ids)
+
+            return ThirteenDRace(
+                race_info=race_info,
+                runners=runners,
+                timestamp=cache.get("generated_at", datetime.now().isoformat()),
+                predictions_status="cached_model",
+            )
+
+        # No cache — lightweight fallback using ratings only (no ML models)
         features_df = build_features_for_races(con, [race_id])
 
         if features_df.empty:
             return ThirteenDRace(
-                race_info=race_info,
-                runners=[],
-                timestamp=datetime.now().isoformat(),
+                race_info=race_info, runners=[], timestamp=datetime.now().isoformat(),
                 predictions_status="no_data",
             )
 
         dim_scores = compute_thirteen_d_scores(features_df, race_id)
 
-        # Try loading trained model predictions
         win_probs = {}
         place_probs = {}
-        try:
-            from ..models import load_model
-            win_model = load_model("win")
-            place_model = load_model("place")
+        ratings = features_df[["horse_name", "official_rating"]].copy()
+        ratings["official_rating"] = ratings["official_rating"].fillna(50)
+        total = ratings["official_rating"].sum()
+        if total > 0:
+            for _, row in ratings.iterrows():
+                name = row["horse_name"]
+                prob = float(row["official_rating"]) / total
+                win_probs[name] = prob
+                place_probs[name] = min(prob * 2.5, 0.95)
 
-            feature_names = win_model["feature_names"]
-
-            X = features_df.reindex(columns=feature_names).copy()
-            for col in X.columns:
-                X[col] = pd.to_numeric(X[col], errors="coerce")
-
-            ens_win = _predict_stacked(win_model, X, feature_names)
-            ens_place = _predict_stacked(place_model, X, feature_names)
-
-            for i, (_, row) in enumerate(features_df.iterrows()):
-                name = row.get("horse_name", "")
-                if name:
-                    win_probs[name] = float(ens_win[i])
-                    place_probs[name] = float(ens_place[i])
-        except Exception as e:
-            logger.info(f"Model predictions not available: {e}")
-
-        # If no model, use rating-based fallback
-        if not win_probs:
-            ratings = features_df[["horse_name", "official_rating"]].copy()
-            ratings["official_rating"] = ratings["official_rating"].fillna(50)
-            total = ratings["official_rating"].sum()
-            if total > 0:
-                for _, row in ratings.iterrows():
-                    name = row["horse_name"]
-                    prob = float(row["official_rating"]) / total
-                    win_probs[name] = prob
-                    place_probs[name] = min(prob * 2.5, 0.95)
-
-        # Build runner predictions
         runners = []
         for _, row in features_df.iterrows():
             name = row.get("horse_name", "")
@@ -367,32 +415,26 @@ def get_thirteen_d(race_id: int):
             runners.append(RunnerPrediction(
                 horse_name=name,
                 draw=int(row["draw"]) if row.get("draw") and not pd.isna(row.get("draw")) else None,
-                jockey=None,
-                trainer=None,
+                jockey=None, trainer=None,
                 age=int(row["age"]) if row.get("age") and not pd.isna(row.get("age")) else None,
                 weight_lbs=int(row["weight_lbs"]) if row.get("weight_lbs") and not pd.isna(row.get("weight_lbs")) else None,
                 official_rating=int(row["official_rating"]) if row.get("official_rating") and not pd.isna(row.get("official_rating")) else None,
-                win_prob=round(wp, 4),
-                place_prob=round(pp, 4),
-                win_rank=0,
-                place_rank=0,
+                win_prob=round(wp, 4), place_prob=round(pp, 4),
+                win_rank=0, place_rank=0,
                 fair_odds=round(1.0 / max(wp, 0.001), 2),
                 dimensions=[DimensionScore(**d) for d in dims],
                 positive_drivers=[DriverItem(**d) for d in pos_drivers],
                 negative_drivers=[DriverItem(**d) for d in neg_drivers],
             ))
 
-        # Assign ranks
         runners.sort(key=lambda r: r.win_prob, reverse=True)
         for i, r in enumerate(runners):
             r.win_rank = i + 1
-
         runners_by_place = sorted(runners, key=lambda r: r.place_prob, reverse=True)
         for i, r in enumerate(runners_by_place):
             r.place_rank = i + 1
 
-        # Get jockey/trainer names + api_horse_id from results table
-        runner_api_ids = {}  # horse_name -> api_horse_id
+        runner_api_ids = {}
         try:
             jt_rows = con.execute("""
                 SELECT horse_name, jockey_name, trainer_name, api_horse_id, silk_url
@@ -411,19 +453,15 @@ def get_thirteen_d(race_id: int):
         except Exception:
             pass
 
-        # Attach live odds directly from Racing API (no DB)
         _attach_odds(race_id, runners, api_race_id, runner_api_ids)
-
-        model_type = "model" if win_probs else "fallback"
+        model_type = "fallback"
     finally:
         con.close()
 
-    # Persist predictions AFTER read connection is closed (avoids DuckDB conflict)
     _save_predictions(race_id, runners, model_type)
 
     return ThirteenDRace(
-        race_info=race_info,
-        runners=runners,
+        race_info=race_info, runners=runners,
         timestamp=datetime.now().isoformat(),
         predictions_status=model_type,
     )
@@ -775,149 +813,24 @@ def clear_odds_cache():
 
 @app.get("/api/best-bets", response_model=BestBetsResponse)
 def get_best_bets(date: Optional[str] = Query(None, description="YYYY-MM-DD")):
-    """Top 3 each-way Trixie picks across all meetings for a given date."""
-    import numpy as np
-    import xgboost as xgb
+    """Top picks — served from pre-computed cache (generated locally)."""
     from datetime import date as date_type
 
     target_date = date or str(date_type.today())
 
-    con = _get_con()
-    try:
-        race_rows = con.execute("""
-            SELECT ra.race_id, m.course, ra.race_name,
-                   COALESCE(ra.race_time, strftime(ra.off_dt, '%H:%M')) as race_time,
-                   ra.num_runners, ra.api_race_id
-            FROM races ra
-            JOIN meetings m ON ra.meeting_id = m.meeting_id
-            WHERE m.meeting_date = ? AND ra.num_runners >= 4
-            ORDER BY ra.off_dt
-        """, [target_date]).fetchall()
-
-        if not race_rows:
-            return BestBetsResponse(
-                date=target_date, picks=[], total_races_scanned=0,
-                timestamp=datetime.now().isoformat(),
-            )
-
-        race_ids = [r[0] for r in race_rows]
-        race_meta = {r[0]: {"course": r[1], "race_name": r[2], "race_time": r[3],
-                            "num_runners": r[4], "api_race_id": r[5]} for r in race_rows}
-
-        features_df = build_features_for_races(con, race_ids)
-    finally:
-        con.close()
-
-    if features_df.empty:
+    cache = _load_cache(target_date)
+    if cache and "best_bets" in cache:
+        bb = cache["best_bets"]
+        picks = [BestBetRunner(**p) for p in bb.get("picks", [])]
         return BestBetsResponse(
-            date=target_date, picks=[], total_races_scanned=len(race_ids),
-            timestamp=datetime.now().isoformat(),
+            date=target_date,
+            picks=picks,
+            total_races_scanned=bb.get("total_races_scanned", 0),
+            timestamp=bb.get("timestamp", datetime.now().isoformat()),
         )
-
-    try:
-        from ..models import load_model
-        win_model = load_model("win")
-        place_model = load_model("place")
-        feature_names = win_model["feature_names"]
-
-        X = features_df.reindex(columns=feature_names).copy()
-        for col in X.columns:
-            X[col] = pd.to_numeric(X[col], errors="coerce")
-
-        win_probs = _predict_stacked(win_model, X, feature_names)
-        place_probs = _predict_stacked(place_model, X, feature_names)
-
-        features_df = features_df.copy()
-        features_df["_win_prob"] = win_probs
-        features_df["_place_prob"] = place_probs
-        features_df["_ew_score"] = 0.3 * win_probs + 0.7 * place_probs
-    except Exception as e:
-        logger.warning(f"Best bets model load failed: {e}")
-        return BestBetsResponse(
-            date=target_date, picks=[], total_races_scanned=len(race_ids),
-            timestamp=datetime.now().isoformat(),
-        )
-
-    con2 = _get_con()
-    try:
-        jt_rows = con2.execute("""
-            SELECT horse_name, jockey_name, trainer_name, race_id
-            FROM results WHERE race_id IN ({})
-        """.format(",".join(str(r) for r in race_ids))).fetchall()
-        jt_map = {(r[0], r[3]): (r[1], r[2]) for r in jt_rows}
-    except Exception:
-        jt_map = {}
-    finally:
-        con2.close()
-
-    candidates = []
-    for race_id, group in features_df.groupby("race_id"):
-        meta = race_meta.get(race_id, {})
-        nr = meta.get("num_runners", len(group))
-        if nr < 4:
-            continue
-
-        sorted_group = group.sort_values("_ew_score", ascending=False)
-        top = sorted_group.iloc[0]
-
-        wp = float(top["_win_prob"])
-        pp = float(top["_place_prob"])
-        ew = float(top["_ew_score"])
-        gap = pp - wp
-        field_avg_pp = group["_place_prob"].mean()
-        edge = pp - field_avg_pp
-
-        jt = jt_map.get((top["horse_name"], race_id), (None, None))
-
-        reason_parts = []
-        if pp > 0.45:
-            reason_parts.append("strong place chance")
-        if wp > 0.2:
-            reason_parts.append("genuine win contender")
-        if gap > 0.25:
-            reason_parts.append(f"{gap*100:.0f}% place safety net")
-        if edge > 0.15:
-            reason_parts.append("big edge over field")
-        if top.get("form_avg_pos_3") and float(top.get("form_avg_pos_3", 99)) <= 3.0:
-            reason_parts.append("consistent recent form")
-        if not reason_parts:
-            reason_parts.append("best E/W value in race")
-
-        candidates.append({
-            "horse_name": str(top["horse_name"]),
-            "course": meta.get("course", ""),
-            "race_time": meta.get("race_time"),
-            "race_name": meta.get("race_name"),
-            "race_id": int(race_id),
-            "win_prob": round(wp, 4),
-            "place_prob": round(pp, 4),
-            "pct_gap": round(gap, 4),
-            "fair_odds": round(1.0 / max(wp, 0.001), 2),
-            "jockey": jt[0],
-            "trainer": jt[1],
-            "official_rating": int(top["official_rating"]) if pd.notna(top.get("official_rating")) else None,
-            "confidence": round(ew, 4),
-            "reason": " + ".join(reason_parts),
-        })
-
-    candidates.sort(key=lambda c: (c["confidence"], c["pct_gap"]), reverse=True)
-
-    seen_horses: set[str] = set()
-    top_4: list[dict] = []
-    for c in candidates:
-        if c["horse_name"] in seen_horses:
-            continue
-        seen_horses.add(c["horse_name"])
-        top_4.append(c)
-        if len(top_4) == 4:
-            break
-
-    picks = [BestBetRunner(**c) for c in top_4]
 
     return BestBetsResponse(
-        date=target_date,
-        picks=picks,
-        total_races_scanned=len(race_ids),
+        date=target_date, picks=[], total_races_scanned=0,
         timestamp=datetime.now().isoformat(),
     )
 
