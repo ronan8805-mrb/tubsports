@@ -32,11 +32,11 @@ export function RaceDetail() {
   const { race_info, runners } = data;
 
   return (
-    <div className="max-w-5xl mx-auto px-4 py-6">
+    <div className="max-w-5xl mx-auto px-3 py-4 sm:px-4 sm:py-6">
       {/* Back link */}
       <button
         onClick={() => navigate(-1)}
-        className="inline-flex items-center gap-1 text-xs text-gray-500 hover:text-gray-300 mb-4 transition-colors"
+        className="inline-flex items-center gap-1 text-xs text-gray-500 hover:text-gray-300 mb-3 sm:mb-4 transition-colors"
       >
         <svg className="w-3 h-3" fill="none" viewBox="0 0 24 24" stroke="currentColor">
           <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M15 19l-7-7 7-7" />
@@ -45,55 +45,52 @@ export function RaceDetail() {
       </button>
 
       {/* Race header */}
-      <div className="bg-gray-900 border border-gray-800 rounded-2xl p-5 mb-6">
-        <div className="flex flex-wrap items-start justify-between gap-4">
-          <div>
-            <h1 className="text-xl font-bold text-white flex items-center gap-2">
-              {race_info.race_time && (
-                <span className="inline-flex items-center px-2 py-0.5 rounded bg-amber-500/15 text-amber-400 text-sm font-bold tabular-nums border border-amber-500/20">
-                  {race_info.race_time}
-                </span>
-              )}
-              {race_info.course} - Race {race_info.race_number}
-            </h1>
-            {race_info.race_name && (
-              <p className="text-sm text-gray-400 mt-1">{race_info.race_name}</p>
-            )}
-            <p className="text-xs text-gray-500 mt-1">{race_info.meeting_date}</p>
-          </div>
-
-          <div className="flex flex-wrap gap-2">
-            {race_info.distance_furlongs && (
-              <span className="px-2.5 py-1 rounded-lg text-xs font-medium bg-blue-500/10 text-blue-400 border border-blue-500/20">
-                {race_info.distance_furlongs}f
+      <div className="bg-gray-900 border border-gray-800 rounded-xl sm:rounded-2xl p-3 sm:p-5 mb-4 sm:mb-6">
+        <div>
+          <h1 className="text-base sm:text-xl font-bold text-white flex items-center gap-2 flex-wrap">
+            {race_info.race_time && (
+              <span className="inline-flex items-center px-2 py-0.5 rounded bg-amber-500/15 text-amber-400 text-xs sm:text-sm font-bold tabular-nums border border-amber-500/20">
+                {race_info.race_time}
               </span>
             )}
-            {race_info.race_type && (
-              <span className="px-2.5 py-1 rounded-lg text-xs font-medium bg-purple-500/10 text-purple-400 border border-purple-500/20">
-                {race_info.race_type}
-              </span>
-            )}
-            {race_info.race_class && (
-              <span className="px-2.5 py-1 rounded-lg text-xs font-medium bg-amber-500/10 text-amber-400 border border-amber-500/20">
-                {race_info.race_class}
-              </span>
-            )}
-            {race_info.going && (
-              <span className="px-2.5 py-1 rounded-lg text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
-                {race_info.going}
-              </span>
-            )}
-            {race_info.surface && (
-              <span className="px-2.5 py-1 rounded-lg text-xs font-medium bg-gray-500/10 text-gray-400 border border-gray-500/20">
-                {race_info.surface}
-              </span>
-            )}
-            <span className="px-2.5 py-1 rounded-lg text-xs font-medium bg-sky-500/10 text-sky-400 border border-sky-500/20">
-              {race_info.num_runners} runners
-            </span>
-          </div>
+            <span>{race_info.course} - Race {race_info.race_number}</span>
+          </h1>
+          {race_info.race_name && (
+            <p className="text-xs sm:text-sm text-gray-400 mt-1">{race_info.race_name}</p>
+          )}
+          <p className="text-[10px] sm:text-xs text-gray-500 mt-1">{race_info.meeting_date}</p>
         </div>
 
+        <div className="flex flex-wrap gap-1.5 sm:gap-2 mt-3">
+          {race_info.distance_furlongs && (
+            <span className="px-2 py-0.5 sm:px-2.5 sm:py-1 rounded-lg text-[10px] sm:text-xs font-medium bg-blue-500/10 text-blue-400 border border-blue-500/20">
+              {race_info.distance_furlongs}f
+            </span>
+          )}
+          {race_info.race_type && (
+            <span className="px-2 py-0.5 sm:px-2.5 sm:py-1 rounded-lg text-[10px] sm:text-xs font-medium bg-purple-500/10 text-purple-400 border border-purple-500/20">
+              {race_info.race_type}
+            </span>
+          )}
+          {race_info.race_class && (
+            <span className="px-2 py-0.5 sm:px-2.5 sm:py-1 rounded-lg text-[10px] sm:text-xs font-medium bg-amber-500/10 text-amber-400 border border-amber-500/20">
+              {race_info.race_class}
+            </span>
+          )}
+          {race_info.going && (
+            <span className="px-2 py-0.5 sm:px-2.5 sm:py-1 rounded-lg text-[10px] sm:text-xs font-medium bg-emerald-500/10 text-emerald-400 border border-emerald-500/20">
+              {race_info.going}
+            </span>
+          )}
+          {race_info.surface && (
+            <span className="px-2 py-0.5 sm:px-2.5 sm:py-1 rounded-lg text-[10px] sm:text-xs font-medium bg-gray-500/10 text-gray-400 border border-gray-500/20">
+              {race_info.surface}
+            </span>
+          )}
+          <span className="px-2 py-0.5 sm:px-2.5 sm:py-1 rounded-lg text-[10px] sm:text-xs font-medium bg-sky-500/10 text-sky-400 border border-sky-500/20">
+            {race_info.num_runners} runners
+          </span>
+        </div>
       </div>
 
       {/* Runners */}
