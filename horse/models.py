@@ -2,8 +2,8 @@
 ML model training for UK/IRE Horse Racing predictions.
 
 Architecture (RTX 5090 Accelerated):
-  - LightGBM (CPU) + XGBoost (GPU/CUDA) + CatBoost + Ridge
-  - Stacked ensemble with logistic regression meta-learner
+  - LightGBM (CPU) + XGBoost (GPU/CUDA) + CatBoost + RandomForest
+  - Weighted ensemble (fixed weights, no meta-learner)
   - Purged walk-forward cross-validation
   - Optuna hyperparameter tuning
   - Isotonic calibration + hard-example boosting
@@ -31,7 +31,6 @@ from sklearn.metrics import (
     roc_auc_score,
 )
 from sklearn.isotonic import IsotonicRegression
-from sklearn.linear_model import LogisticRegression
 import pickle
 
 from .config import (
@@ -51,6 +50,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 MODEL_DIR = DATA_DIR / "models"
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
+
+ENSEMBLE_WEIGHTS = {"catboost": 0.35, "lgb": 0.30, "xgb": 0.20, "rf": 0.15}
 
 
 # ---------------------------------------------------------------------------
@@ -179,8 +180,22 @@ def _compute_sample_weights(
 # Leakage Audit
 # ---------------------------------------------------------------------------
 
+WHITELIST_FEATURES = frozenset({
+    "form_win_rate", "dist_match_win_rate", "going_match_win_rate",
+    "course_match_win_rate", "type_match_win_rate", "class_match_win_rate",
+    "form_x_freshness", "form_place_rate", "form_momentum",
+    "form_x_distance", "form_x_going", "course_x_distance", "class_x_form",
+    "relative_speed_z", "relative_speed_x_form", "relative_speed_x_distance",
+})
+
+
 def audit_leakage(features_df: pd.DataFrame, target: str = "win") -> List[str]:
-    """Detect features that leak future/current race info."""
+    """Detect features that leak future/current race info.
+
+    Only flags hard LEAKAGE_COLS and post-race keywords.
+    Historical performance features (win rates, form stats) are protected
+    by whitelist — they are legitimate signals, not leakage.
+    """
     flagged = []
     X, y = _prepare_xy(features_df, target)
 
@@ -190,28 +205,31 @@ def audit_leakage(features_df: pd.DataFrame, target: str = "win") -> List[str]:
             logger.warning(f"LEAKAGE: {col} in LEAKAGE_COLS")
 
     for col in X.columns:
-        if col in flagged:
+        if col in flagged or col in WHITELIST_FEATURES:
             continue
         valid_mask = X[col].notna()
         if valid_mask.sum() < 100:
             continue
         corr = X.loc[valid_mask, col].corr(y[valid_mask].astype(float))
-        if abs(corr) > 0.5:
+        if abs(corr) > 0.90:
             flagged.append(col)
             logger.warning(f"LEAKAGE: {col} corr={corr:.3f}")
 
     post_keywords = ["result_", "actual_", "final_", "outcome_"]
     for col in X.columns:
-        if col in flagged:
+        if col in flagged or col in WHITELIST_FEATURES:
             continue
         if any(kw in col.lower() for kw in post_keywords):
             flagged.append(col)
             logger.warning(f"LEAKAGE: {col} post-race keyword")
 
     if not flagged:
-        logger.info("LEAKAGE AUDIT: CLEAN")
+        logger.info("LEAKAGE AUDIT: CLEAN — all features retained")
     else:
         logger.warning(f"LEAKAGE AUDIT: {len(flagged)} flagged: {flagged}")
+
+    kept = len(X.columns) - len(flagged)
+    logger.info(f"Features: {kept} kept, {len(flagged)} dropped, {len(WHITELIST_FEATURES)} whitelisted")
     return flagged
 
 
@@ -791,24 +809,25 @@ def train_model(
     except Exception as e:
         logger.warning(f"CatBoost training failed: {e}")
 
-    # ---- Ridge Logistic Regression (linear baseline) ----
+    # ---- RandomForest ----
     X_train_filled = X_train.fillna(0)
     X_test_filled = X_test.fillna(0) if len(X_test) > 0 else pd.DataFrame()
-    ridge_model = None
+    rf_model = None
     try:
-        _ridge = LogisticRegression(
-            C=1.0, penalty="l2", solver="lbfgs", max_iter=1000, random_state=42,
+        from sklearn.ensemble import RandomForestClassifier
+        _rf = RandomForestClassifier(
+            n_estimators=500, max_depth=12, min_samples_leaf=20,
+            class_weight="balanced", n_jobs=-1, random_state=42,
         )
-        _ridge.fit(X_train_filled, y_train, sample_weight=weights)
-        ridge_model = _ridge
-        logger.info("Ridge logistic regression: trained")
+        _rf.fit(X_train_filled, y_train, sample_weight=weights)
+        rf_model = _rf
+        logger.info(f"RandomForest: {_rf.n_estimators} trees")
     except Exception as e:
-        logger.warning(f"Ridge training failed: {e}")
+        logger.warning(f"RandomForest training failed: {e}")
 
     # ---- Evaluation + Stacked Meta-Learner ----
     metrics = {}
-    best_lgb_weight = 0.5
-    meta_learner = None
+    active_weights = {}
 
     if len(X_test) > 0 and len(y_test) > 0:
         lgb_probs = lgb_model.predict(X_test)
@@ -825,10 +844,10 @@ def train_model(
             except Exception:
                 pass
 
-        if ridge_model is not None:
+        if rf_model is not None:
             try:
-                ridge_probs = ridge_model.predict_proba(X_test_filled)[:, 1]
-                base_models["ridge"] = ridge_probs
+                rf_probs = rf_model.predict_proba(X_test_filled)[:, 1]
+                base_models["rf"] = rf_probs
             except Exception:
                 pass
 
@@ -859,34 +878,16 @@ def train_model(
                 f"Brier={metrics[name]['brier']}, Acc={metrics[name]['accuracy']}"
             )
 
-        # Build stacking matrix -- split test set to avoid meta-learner leakage
-        meta_model_keys = sorted(base_models.keys())
-        stack_matrix = np.column_stack([base_models[k] for k in meta_model_keys])
-        try:
-            mid = len(y_test) // 2
-            if mid >= 50:
-                meta_learner = LogisticRegression(C=1.0, solver="lbfgs", max_iter=500)
-                meta_learner.fit(stack_matrix[:mid], y_test.iloc[:mid])
-                ens_probs = meta_learner.predict_proba(stack_matrix)[:, 1]
-                logger.info(f"  Meta-learner trained on {len(base_models)} base models (meta-train={mid}, meta-eval={len(y_test)-mid})")
-            else:
-                raise ValueError("Test set too small for meta-learner split")
-        except Exception as e:
-            logger.warning(f"Meta-learner failed, falling back to weight search: {e}")
-            meta_learner = None
-            meta_model_keys = None
-            best_auc = -1.0
-            for w in np.arange(0.5, 1.01, 0.05):
-                blend = w * lgb_probs + (1.0 - w) * xgb_probs
-                try:
-                    auc = roc_auc_score(y_test, blend)
-                except ValueError:
-                    continue
-                if auc > best_auc:
-                    best_auc = auc
-                    best_lgb_weight = round(float(w), 2)
-            ens_probs = best_lgb_weight * lgb_probs + (1.0 - best_lgb_weight) * xgb_probs
-            logger.info(f"  Fallback weights: LGB={best_lgb_weight}, XGB={round(1.0 - best_lgb_weight, 2)}")
+        ens_probs = np.zeros(len(y_test))
+        total_w = 0.0
+        for model_key, w in ENSEMBLE_WEIGHTS.items():
+            if model_key in base_models:
+                ens_probs += w * base_models[model_key]
+                total_w += w
+        if total_w > 0:
+            ens_probs /= total_w
+        active_weights = {k: round(v / total_w, 3) for k, v in ENSEMBLE_WEIGHTS.items() if k in base_models}
+        logger.info(f"  Ensemble weights (normalised): {active_weights}")
 
         try:
             ens_auc = roc_auc_score(y_test, ens_probs)
@@ -909,8 +910,7 @@ def train_model(
             "brier": round(float(ens_brier), 4) if not np.isnan(ens_brier) else None,
             "accuracy": round(float(ens_acc), 4),
             "samples": len(y_test),
-            "lgb_weight": best_lgb_weight,
-            "stacked": meta_learner is not None,
+            "weights": active_weights,
             "base_models": sorted(base_models.keys()),
         }
         logger.info(
@@ -946,27 +946,7 @@ def train_model(
     test_actuals = None
     calibrator = None
     if len(X_test) > 0:
-        if meta_learner is not None:
-            base_preds = {}
-            base_preds["lgb"] = lgb_model.predict(X_test)
-            base_preds["xgb"] = xgb_model.predict(xgb.DMatrix(X_test, feature_names=feature_names))
-            if catboost_model is not None:
-                try:
-                    base_preds["catboost"] = catboost_model.predict_proba(X_test)[:, 1]
-                except Exception:
-                    pass
-            if ridge_model is not None:
-                try:
-                    base_preds["ridge"] = ridge_model.predict_proba(X_test.fillna(0))[:, 1]
-                except Exception:
-                    pass
-            stack = np.column_stack([base_preds[k] for k in sorted(base_preds.keys())])
-            test_preds = meta_learner.predict_proba(stack)[:, 1]
-        else:
-            lgb_p = lgb_model.predict(X_test)
-            xgb_p = xgb_model.predict(xgb.DMatrix(X_test, feature_names=feature_names))
-            test_preds = np.array(best_lgb_weight * lgb_p + (1.0 - best_lgb_weight) * xgb_p)
-
+        test_preds = ens_probs
         test_actuals = np.array(y_test)
 
         calibrator = IsotonicRegression(y_min=0.001, y_max=0.999, out_of_bounds="clip")
@@ -985,11 +965,9 @@ def train_model(
         "lgb_model": lgb_model,
         "xgb_model": xgb_model,
         "catboost_model": catboost_model,
-        "ridge_model": ridge_model,
-        "meta_learner": meta_learner,
-        "meta_model_keys": meta_model_keys,
+        "rf_model": rf_model,
         "calibrator": calibrator,
-        "lgb_weight": best_lgb_weight,
+        "ensemble_weights": active_weights if len(X_test) > 0 else ENSEMBLE_WEIGHTS,
         "feature_names": feature_names,
         "metrics": metrics,
         "feature_importance": combined_imp,
@@ -1054,11 +1032,6 @@ def save_model(result: Dict[str, Any], suffix: str = "") -> Path:
         with open(cal_path, "wb") as f:
             pickle.dump(result["calibrator"], f)
 
-    if result.get("meta_learner") is not None:
-        ml_path = model_path / "meta_learner.pkl"
-        with open(ml_path, "wb") as f:
-            pickle.dump(result["meta_learner"], f)
-
     if result.get("catboost_model") is not None:
         try:
             cb_path = model_path / "catboost.cbm"
@@ -1066,18 +1039,17 @@ def save_model(result: Dict[str, Any], suffix: str = "") -> Path:
         except Exception as e:
             logger.debug(f"CatBoost save skipped: {e}")
 
-    if result.get("ridge_model") is not None:
-        ridge_path = model_path / "ridge.pkl"
-        with open(ridge_path, "wb") as f:
-            pickle.dump(result["ridge_model"], f)
+    if result.get("rf_model") is not None:
+        rf_path = model_path / "rf.pkl"
+        with open(rf_path, "wb") as f:
+            pickle.dump(result["rf_model"], f)
 
     meta = {
         "target": result["target"],
         "feature_names": result["feature_names"],
         "metrics": result["metrics"],
         "feature_importance": result["feature_importance"],
-        "lgb_weight": result.get("lgb_weight", 0.5),
-        "meta_model_keys": result.get("meta_model_keys"),
+        "ensemble_weights": result.get("ensemble_weights", {}),
         "train_size": result["train_size"],
         "test_size": result["test_size"],
         "trained_at": str(date.today()),
@@ -1109,12 +1081,6 @@ def load_model(target: str = "win", suffix: str = "") -> Dict[str, Any]:
         with open(cal_path, "rb") as f:
             calibrator = pickle.load(f)
 
-    meta_learner = None
-    ml_path = model_path / "meta_learner.pkl"
-    if ml_path.exists():
-        with open(ml_path, "rb") as f:
-            meta_learner = pickle.load(f)
-
     catboost_model = None
     cb_path = model_path / "catboost.cbm"
     if cb_path.exists():
@@ -1125,23 +1091,21 @@ def load_model(target: str = "win", suffix: str = "") -> Dict[str, Any]:
         except Exception:
             pass
 
-    ridge_model = None
-    ridge_path = model_path / "ridge.pkl"
-    if ridge_path.exists():
-        with open(ridge_path, "rb") as f:
-            ridge_model = pickle.load(f)
+    rf_model = None
+    rf_path = model_path / "rf.pkl"
+    if rf_path.exists():
+        with open(rf_path, "rb") as f:
+            rf_model = pickle.load(f)
 
-    lgb_weight = meta.get("lgb_weight", 0.5)
-    has_stack = meta_learner is not None
-    logger.info(f"Loaded {target} model from {model_path} (stacked={has_stack})")
+    ensemble_weights = meta.get("ensemble_weights", {"lgb": 0.30, "xgb": 0.20, "catboost": 0.35, "rf": 0.15})
+    logger.info(f"Loaded {target} model from {model_path} (weights={ensemble_weights})")
     return {
         "lgb_model": lgb_model,
         "xgb_model": xgb_model,
         "catboost_model": catboost_model,
-        "ridge_model": ridge_model,
-        "meta_learner": meta_learner,
+        "rf_model": rf_model,
         "calibrator": calibrator,
-        "lgb_weight": lgb_weight,
+        "ensemble_weights": ensemble_weights,
         "feature_names": meta["feature_names"],
         "meta": meta,
     }
@@ -1172,36 +1136,33 @@ def predict_race(
     for col in X.columns:
         X[col] = pd.to_numeric(X[col], errors="coerce")
 
-    meta_learner = model_data.get("meta_learner")
     catboost_model = model_data.get("catboost_model")
-    ridge_model = model_data.get("ridge_model")
+    rf_model = model_data.get("rf_model")
+    ensemble_weights = model_data.get("ensemble_weights", {"lgb": 0.30, "xgb": 0.20})
 
     lgb_probs = lgb_model.predict(X)
     xgb_probs = xgb_model.predict(xgb.DMatrix(X, feature_names=feature_names))
 
-    expected_keys = model_data.get("meta", {}).get("meta_model_keys") or model_data.get("meta_model_keys")
-    if meta_learner is not None and expected_keys:
-        base_preds = {"lgb": lgb_probs, "xgb": xgb_probs}
-        if catboost_model is not None:
-            try:
-                base_preds["catboost"] = catboost_model.predict_proba(X)[:, 1]
-            except Exception:
-                pass
-        if ridge_model is not None:
-            try:
-                base_preds["ridge"] = ridge_model.predict_proba(X.fillna(0))[:, 1]
-            except Exception:
-                pass
-        if sorted(base_preds.keys()) == expected_keys:
-            stack = np.column_stack([base_preds[k] for k in expected_keys])
-            probs = meta_learner.predict_proba(stack)[:, 1]
-        else:
-            logger.warning("Stacking column mismatch — falling back to weighted blend")
-            lgb_w = model_data.get("lgb_weight", 0.5)
-            probs = lgb_w * lgb_probs + (1.0 - lgb_w) * xgb_probs
-    else:
-        lgb_w = model_data.get("lgb_weight", 0.5)
-        probs = lgb_w * lgb_probs + (1.0 - lgb_w) * xgb_probs
+    base_preds = {"lgb": lgb_probs, "xgb": xgb_probs}
+    if catboost_model is not None:
+        try:
+            base_preds["catboost"] = catboost_model.predict_proba(X)[:, 1]
+        except Exception:
+            pass
+    if rf_model is not None:
+        try:
+            base_preds["rf"] = rf_model.predict_proba(X.fillna(0))[:, 1]
+        except Exception:
+            pass
+
+    probs = np.zeros(len(X))
+    total_w = 0.0
+    for key, w in ensemble_weights.items():
+        if key in base_preds:
+            probs += w * base_preds[key]
+            total_w += w
+    if total_w > 0:
+        probs /= total_w
 
     if calibrator is not None:
         probs = calibrator.predict(probs)

@@ -33,6 +33,35 @@ export function AdminDashboard() {
   // DB stats
   const [health, setHealth] = useState<any>(null);
 
+  // Security events
+  const [securityEvents, setSecurityEvents] = useState<any[]>([]);
+
+  const loadSecurityEvents = useCallback(async () => {
+    try {
+      const res = await fetch(`${API_BASE}/api/auth/security-events`, { headers: authHeader() });
+      if (res.ok) setSecurityEvents(await res.json());
+    } catch {}
+  }, [authHeader]);
+
+  const handleResetDevice = async (uid: number, uname: string) => {
+    if (!confirm(`Reset device lock for "${uname}"? They will be able to log in from a new device.`)) return;
+    try {
+      const res = await fetch(`${API_BASE}/api/auth/users/${uid}/reset-device`, {
+        method: 'POST',
+        headers: authHeader(),
+      });
+      if (!res.ok) {
+        const d = await res.json().catch(() => ({}));
+        throw new Error(d.detail || 'Failed');
+      }
+      setMsg({ text: `Device reset for "${uname}"`, type: 'ok' });
+      loadSecurityEvents();
+    } catch (e) {
+      setMsg({ text: e instanceof Error ? e.message : 'Failed', type: 'err' });
+    }
+    setTimeout(() => setMsg(null), 4000);
+  };
+
   const loadUsers = useCallback(async () => {
     try {
       const res = await fetch(`${API_BASE}/api/auth/users`, { headers: authHeader() });
@@ -42,8 +71,9 @@ export function AdminDashboard() {
 
   useEffect(() => {
     loadUsers();
+    loadSecurityEvents();
     api.getHealth().then(setHealth).catch(() => {});
-  }, [loadUsers]);
+  }, [loadUsers, loadSecurityEvents]);
 
   const handleCreate = async () => {
     if (!newUser.trim() || !newPass.trim()) return;
@@ -302,16 +332,63 @@ export function AdminDashboard() {
                 </div>
               </div>
               {u.role !== 'admin' && (
-                <button
-                  onClick={() => handleDelete(u.user_id, u.username)}
-                  className="text-xs text-red-400 hover:text-red-300 px-3 py-1 rounded hover:bg-red-500/10 transition-colors"
-                >
-                  Remove
-                </button>
+                <div className="flex gap-2">
+                  <button
+                    onClick={() => handleResetDevice(u.user_id, u.username)}
+                    className="text-xs text-amber-400 hover:text-amber-300 px-3 py-1 rounded hover:bg-amber-500/10 transition-colors"
+                  >
+                    Reset Device
+                  </button>
+                  <button
+                    onClick={() => handleDelete(u.user_id, u.username)}
+                    className="text-xs text-red-400 hover:text-red-300 px-3 py-1 rounded hover:bg-red-500/10 transition-colors"
+                  >
+                    Remove
+                  </button>
+                </div>
               )}
             </div>
           ))}
         </div>
+      </div>
+
+      {/* Security Alerts */}
+      <div className="bg-gray-900/60 rounded-xl p-5 border border-gray-700/50">
+        <h2 className="text-lg font-semibold text-white mb-3 flex items-center gap-2">
+          <span className="text-red-400">&#9888;</span> Security Alerts
+        </h2>
+        {securityEvents.length === 0 ? (
+          <p className="text-sm text-gray-500">No security events</p>
+        ) : (
+          <div className="space-y-2 max-h-64 overflow-y-auto">
+            {securityEvents.map((ev) => (
+              <div
+                key={ev.event_id}
+                className={`flex items-start justify-between rounded-lg px-4 py-3 text-sm ${
+                  ev.event_type === 'device_mismatch'
+                    ? 'bg-red-500/10 border border-red-500/30'
+                    : ev.event_type === 'failed_login'
+                    ? 'bg-amber-500/10 border border-amber-500/30'
+                    : 'bg-gray-800/50 border border-gray-700/30'
+                }`}
+              >
+                <div>
+                  <p className="font-medium text-white">
+                    {ev.event_type === 'device_mismatch' && 'Device Mismatch'}
+                    {ev.event_type === 'failed_login' && 'Failed Login'}
+                    {ev.event_type === 'rate_limited' && 'Rate Limited'}
+                    {ev.event_type === 'device_reset' && 'Device Reset'}
+                    <span className="text-gray-400 font-normal ml-2">@{ev.username}</span>
+                  </p>
+                  <p className="text-xs text-gray-400 mt-0.5">{ev.detail}</p>
+                </div>
+                <span className="text-[11px] text-gray-500 whitespace-nowrap ml-4">
+                  {ev.created_at?.split('.')[0]}
+                </span>
+              </div>
+            ))}
+          </div>
+        )}
       </div>
     </div>
   );

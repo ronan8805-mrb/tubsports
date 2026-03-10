@@ -184,14 +184,18 @@ def main():
                 f"Acc={ens['accuracy']}"
             )
 
-    logger.info("TOP 10 WIN FEATURES:")
+    logger.info("TOP 30 WIN FEATURES:")
     imp_items = list(win["feature_importance"].items())
-    for i, (f, v) in enumerate(imp_items[:10]):
+    for i, (f, v) in enumerate(imp_items[:30]):
         logger.info(f"  {i + 1}. {f}: {v:.1f}")
 
     tracked_features = [
-        "avg_speed_last_3", "best_speed_last_6", "speed_trend",
-        "jockey_win_rate_365d", "trainer_win_rate_365d", "course_match_win_rate",
+        "form_win_rate", "dist_match_win_rate", "going_match_win_rate",
+        "course_match_win_rate", "type_match_win_rate", "class_match_win_rate",
+        "form_x_freshness", "form_x_distance", "form_x_going",
+        "course_x_distance", "class_x_form", "finish_strength",
+        "relative_speed_z", "relative_speed_x_form", "relative_speed_x_distance",
+        "jockey_win_rate_365d", "trainer_win_rate_365d",
     ]
     logger.info("TRACKED FEATURE RANKINGS:")
     imp_ranked = {feat: rank + 1 for rank, (feat, _) in enumerate(
@@ -319,7 +323,7 @@ def main():
             "feature_count": len(win["feature_names"]),
             "train_size": win["train_size"],
             "test_size": win["test_size"],
-            "stacked": win_ens.get("stacked", False),
+            "weights": win_ens.get("weights", {}),
         }
         save_monitoring_snapshot(snapshot)
         logger.info("Monitoring snapshot saved")

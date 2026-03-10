@@ -6,6 +6,7 @@ numpy
 lightgbm
 xgboost
 scikit-learn
+catboost
 PyJWT
 python-dotenv
 requests

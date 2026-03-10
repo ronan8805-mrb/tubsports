@@ -1,5 +1,5 @@
 @echo off
-title RETRAIN - Horse Racing AI (LightGBM + XGBoost GPU)
+title RETRAIN - Horse Racing AI (4-Model Ensemble)
 color 0B
 echo.
 echo ======================================================================
@@ -7,8 +7,8 @@ echo   UK/IRE HORSE RACING AI - RETRAIN
 echo   RTX 5090 GPU Accelerated (XGBoost CUDA)
 echo ======================================================================
 echo.
-echo   LGB + XGB + CatBoost + Ridge stacked ensemble
-echo   130+ features (breeding, NLP, pace, market, intent)
+echo   CatBoost + LightGBM + XGBoost + RandomForest ensemble
+echo   130+ features (breeding, NLP, pace, market, sectionals)
 echo   Purged walk-forward CV + isotonic calibration
 echo.
 echo   --full-rebuild : Rebuild ALL features from scratch

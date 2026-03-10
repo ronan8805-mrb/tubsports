@@ -35,10 +35,13 @@ export function Login() {
 
   return (
     <div
-      className="min-h-screen flex items-center justify-center p-4 bg-cover bg-center bg-no-repeat"
+      className="min-h-screen flex items-center justify-center p-4"
       style={{
-        backgroundImage: 'url(/login-bg.png)',
+        backgroundImage: 'url(/login-bg.jpg)',
         backgroundSize: 'cover',
+        backgroundPosition: 'center center',
+        backgroundRepeat: 'no-repeat',
+        backgroundColor: '#0a0a0a',
       }}
     >
       <div className="w-full max-w-xs">

@@ -38,7 +38,7 @@ logger = logging.getLogger(__name__)
 
 
 def _predict_stacked(model_data: dict, X, feature_names: list):
-    """Run prediction through stacked ensemble or fallback to weighted average."""
+    """Run weighted-average ensemble prediction."""
     import numpy as np
     import xgboost as xgb
 
@@ -47,26 +47,29 @@ def _predict_stacked(model_data: dict, X, feature_names: list):
         xgb.DMatrix(X, feature_names=feature_names)
     )
 
-    meta_learner = model_data.get("meta_learner")
-    if meta_learner is not None:
-        base_preds = {"lgb": lgb_probs, "xgb": xgb_probs}
-        cb = model_data.get("catboost_model")
-        if cb is not None:
-            try:
-                base_preds["catboost"] = cb.predict_proba(X)[:, 1]
-            except Exception:
-                pass
-        ridge = model_data.get("ridge_model")
-        if ridge is not None:
-            try:
-                base_preds["ridge"] = ridge.predict_proba(X.fillna(0))[:, 1]
-            except Exception:
-                pass
-        stack = np.column_stack([base_preds[k] for k in sorted(base_preds.keys())])
-        probs = meta_learner.predict_proba(stack)[:, 1]
-    else:
-        lgb_w = model_data.get("lgb_weight", 0.5)
-        probs = lgb_w * lgb_probs + (1.0 - lgb_w) * xgb_probs
+    base_preds = {"lgb": lgb_probs, "xgb": xgb_probs}
+    cb = model_data.get("catboost_model")
+    if cb is not None:
+        try:
+            base_preds["catboost"] = cb.predict_proba(X)[:, 1]
+        except Exception:
+            pass
+    rf = model_data.get("rf_model")
+    if rf is not None:
+        try:
+            base_preds["rf"] = rf.predict_proba(X.fillna(0))[:, 1]
+        except Exception:
+            pass
+
+    ensemble_weights = model_data.get("ensemble_weights", {"lgb": 0.30, "xgb": 0.20, "catboost": 0.35, "rf": 0.15})
+    probs = np.zeros(len(X))
+    total_w = 0.0
+    for key, w in ensemble_weights.items():
+        if key in base_preds:
+            probs += w * base_preds[key]
+            total_w += w
+    if total_w > 0:
+        probs /= total_w
 
     if model_data.get("calibrator") is not None:
         probs = model_data["calibrator"].predict(probs)
@@ -82,7 +85,12 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=[
+        "https://tubsports.com",
+        "https://www.tubsports.com",
+        "http://localhost:5174",
+        "http://localhost:5173",
+    ],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -818,11 +826,6 @@ def get_best_bets(date: Optional[str] = Query(None, description="YYYY-MM-DD")):
 
         win_probs = _predict_stacked(win_model, X, feature_names)
         place_probs = _predict_stacked(place_model, X, feature_names)
-
-        if win_model.get("calibrator") is not None:
-            win_probs = win_model["calibrator"].predict(np.array(win_probs))
-        if place_model.get("calibrator") is not None:
-            place_probs = place_model["calibrator"].predict(np.array(place_probs))
 
         features_df = features_df.copy()
         features_df["_win_prob"] = win_probs

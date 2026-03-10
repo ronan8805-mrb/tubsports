@@ -206,8 +206,9 @@ def _compute_form_features(form_df: pd.DataFrame, race_date,
 
     feats["form_avg_pos_6"] = positions.mean() if len(positions) > 0 else np.nan
     feats["form_avg_pos_3"] = short_pos.mean() if len(short_pos) > 0 else np.nan
-    feats["form_win_rate"] = (positions == 1).mean() if len(positions) > 0 else 0.0
-    feats["form_place_rate"] = (positions <= 3).mean() if len(positions) > 0 else 0.0
+    n_runs = len(positions)
+    feats["form_win_rate"] = (float((positions == 1).sum()) + 2) / (n_runs + 5) if n_runs > 0 else 0.0
+    feats["form_place_rate"] = (float((positions <= 3).sum()) + 2) / (n_runs + 5) if n_runs > 0 else 0.0
     feats["form_consistency"] = positions.std() if len(positions) > 1 else np.nan
     feats["form_best_pos"] = positions.min() if len(positions) > 0 else np.nan
     feats["form_worst_pos"] = positions.max() if len(positions) > 0 else np.nan
@@ -242,8 +243,9 @@ def _compute_form_features(form_df: pd.DataFrame, race_date,
         dist_rows = form_df[dist_mask]
         feats["dist_match_runs"] = float(len(dist_rows))
         dist_pos = dist_rows["position"].dropna()
-        feats["dist_match_win_rate"] = (dist_pos == 1).mean() if len(dist_pos) > 0 else np.nan
-        feats["dist_match_place_rate"] = (dist_pos <= 3).mean() if len(dist_pos) > 0 else np.nan
+        n_dist = len(dist_pos)
+        feats["dist_match_win_rate"] = (float((dist_pos == 1).sum()) + 2) / (n_dist + 5) if n_dist > 0 else np.nan
+        feats["dist_match_place_rate"] = (float((dist_pos <= 3).sum()) + 2) / (n_dist + 5) if n_dist > 0 else np.nan
     else:
         feats["dist_match_runs"] = np.nan
         feats["dist_match_win_rate"] = np.nan
@@ -256,14 +258,16 @@ def _compute_form_features(form_df: pd.DataFrame, race_date,
     going_rows = form_df[going_mask]
     feats["going_match_runs"] = float(len(going_rows))
     going_pos = going_rows["position"].dropna()
-    feats["going_match_win_rate"] = (going_pos == 1).mean() if len(going_pos) > 0 else np.nan
+    n_going = len(going_pos)
+    feats["going_match_win_rate"] = (float((going_pos == 1).sum()) + 2) / (n_going + 5) if n_going > 0 else np.nan
 
     # --- Course match ---
     if course:
         course_rows = form_df[form_df["course"].str.lower() == course.lower()]
         feats["course_match_runs"] = float(len(course_rows))
         cpos = course_rows["position"].dropna()
-        feats["course_match_win_rate"] = (cpos == 1).mean() if len(cpos) > 0 else np.nan
+        n_course = len(cpos)
+        feats["course_match_win_rate"] = (float((cpos == 1).sum()) + 2) / (n_course + 5) if n_course > 0 else np.nan
     else:
         feats["course_match_runs"] = np.nan
         feats["course_match_win_rate"] = np.nan
@@ -273,7 +277,8 @@ def _compute_form_features(form_df: pd.DataFrame, race_date,
     type_nums = form_df["race_type"].apply(encode_race_type)
     type_rows = form_df[type_nums == race_type_num]
     type_pos = type_rows["position"].dropna()
-    feats["type_match_win_rate"] = (type_pos == 1).mean() if len(type_pos) > 0 else np.nan
+    n_type = len(type_pos)
+    feats["type_match_win_rate"] = (float((type_pos == 1).sum()) + 2) / (n_type + 5) if n_type > 0 else np.nan
 
     # --- Class match ---
     class_num = encode_race_class(race_class_str)
@@ -281,7 +286,8 @@ def _compute_form_features(form_df: pd.DataFrame, race_date,
     class_mask = (class_nums - class_num).abs() <= 1.0
     class_rows = form_df[class_mask]
     class_pos = class_rows["position"].dropna()
-    feats["class_match_win_rate"] = (class_pos == 1).mean() if len(class_pos) > 0 else np.nan
+    n_class = len(class_pos)
+    feats["class_match_win_rate"] = (float((class_pos == 1).sum()) + 2) / (n_class + 5) if n_class > 0 else np.nan
 
     # --- Rating features (from horse_form official_rating) ---
     or_vals = recent["official_rating"].dropna()
@@ -1217,13 +1223,24 @@ def build_features_for_races(con: duckdb.DuckDBPyConnection,
         # Speed relative to field
         if "avg_speed_last_3" in group.columns and group["avg_speed_last_3"].notna().sum() > 0:
             field_avg_speed = group["avg_speed_last_3"].mean()
+            field_std_speed = group["avg_speed_last_3"].std()
+            if pd.isna(field_std_speed) or field_std_speed == 0:
+                field_std_speed = 1.0
             df.loc[idx, "speed_vs_field_avg"] = group["avg_speed_last_3"] - field_avg_speed
             df.loc[idx, "speed_rank_in_field"] = group["avg_speed_last_3"].rank(
                 ascending=False, method="min"
             )
+            df.loc[idx, "relative_speed_z"] = (
+                (group["avg_speed_last_3"] - field_avg_speed) / field_std_speed
+            ).clip(-4, 4)
         else:
             df.loc[idx, "speed_vs_field_avg"] = np.nan
             df.loc[idx, "speed_rank_in_field"] = np.nan
+            df.loc[idx, "relative_speed_z"] = np.nan
+
+    # Interaction features using relative speed z-score
+    df["relative_speed_x_form"] = df["relative_speed_z"] * df.get("form_win_rate", pd.Series(np.nan, index=df.index))
+    df["relative_speed_x_distance"] = df["relative_speed_z"] * df.get("dist_match_win_rate", pd.Series(np.nan, index=df.index))
 
     # --- Field-relative market features ---
     for race_id, group in df.groupby("race_id"):
@@ -1290,6 +1307,28 @@ def build_features_for_races(con: duckdb.DuckDBPyConnection,
     df["class_x_headgear"] = df.get("class_drop", pd.Series(np.nan, index=df.index)).fillna(0) * df.get("first_time_headgear", pd.Series(np.nan, index=df.index)).fillna(0)
     df["sire_x_distance"] = df.get("sire_dist_match_win_rate", pd.Series(np.nan, index=df.index)).fillna(0) * df.get("dist_match_win_rate", pd.Series(np.nan, index=df.index)).fillna(0)
 
+    # --- High-value interaction features ---
+    fwr = df.get("form_win_rate", pd.Series(np.nan, index=df.index))
+    dwr = df.get("dist_match_win_rate", pd.Series(np.nan, index=df.index))
+    gwr = df.get("going_match_win_rate", pd.Series(np.nan, index=df.index))
+    cwr = df.get("course_match_win_rate", pd.Series(np.nan, index=df.index))
+    clwr = df.get("class_match_win_rate", pd.Series(np.nan, index=df.index))
+
+    df["form_x_distance"] = fwr * dwr
+    df["form_x_going"] = fwr * gwr
+    df["course_x_distance"] = cwr * dwr
+    df["class_x_form"] = clwr * fwr
+
+    # Sectional interaction features (where available)
+    sect_fsp = df.get("sect_fsp_avg3", pd.Series(np.nan, index=df.index))
+    sect_early = df.get("sect_early_pos_avg3", pd.Series(np.nan, index=df.index))
+    sect_gain = df.get("sect_position_gain_avg3", pd.Series(np.nan, index=df.index))
+    sect_pace = df.get("sect_pace_consistency_avg3", pd.Series(np.nan, index=df.index))
+
+    df["finish_strength"] = (sect_fsp / sect_pace.replace(0, np.nan)).clip(-5, 5)
+    df["sect_gain_x_form"] = sect_gain * fwr
+    df["early_pos_x_distance"] = sect_early * dwr
+
     # pace_vs_course_bias: does the horse's run style suit this course's pace profile
     if "run_style" in df.columns and "course_pace_bias" in df.columns:
         def _pace_course_match(row):
@@ -1345,7 +1384,13 @@ def build_training_dataset(con: duckdb.DuckDBPyConnection,
     _EXPECTED_NEW_COLS = {"sire_win_rate", "has_headgear", "comment_sentiment_avg",
                           "run_style", "intent_score", "rating_peak_diff",
                           "course_draw_bias", "class_drop",
-                          "sect_fsp_avg3", "sect_coverage"}
+                          "sect_fsp_avg3", "sect_coverage",
+                          "form_x_distance", "form_x_going",
+                          "course_x_distance", "class_x_form",
+                          "finish_strength", "sect_gain_x_form",
+                          "early_pos_x_distance",
+                          "relative_speed_z", "relative_speed_x_form",
+                          "relative_speed_x_distance"}
     if not full_rebuild and FEATURE_MATRIX_PATH.exists():
         saved_df = pd.read_parquet(FEATURE_MATRIX_PATH)
         missing_cols = _EXPECTED_NEW_COLS - set(saved_df.columns)
@@ -1417,6 +1462,11 @@ def build_training_dataset(con: duckdb.DuckDBPyConnection,
         old_race_ids = set(all_race_ids)
         result = result[result["race_id"].isin(old_race_ids)]
 
+        before_dedup = len(result)
+        result = result.drop_duplicates(subset=["race_id", "horse_name"], keep="last")
+        if len(result) < before_dedup:
+            logger.info(f"  Deduped: {before_dedup:,} -> {len(result):,} (removed {before_dedup - len(result):,})")
+
         result.to_parquet(FEATURE_MATRIX_PATH, index=False)
         logger.info(f"Training dataset: {len(result):,} runners, {len(result.columns)} columns (saved)")
         return result
@@ -1437,47 +1487,46 @@ def build_training_dataset(con: duckdb.DuckDBPyConnection,
     logger.info(f"Building features for {len(race_ids)} races ({start_date} to {end_date})")
 
     existing = sorted(cache_dir.glob("batch_*.parquet"))
-    skip_to = len(existing) * batch_size * 10
+    covered_race_ids = set()
     if existing:
-        logger.info(f"  Resumed from cache: {len(existing)} chunks, skipping to race {skip_to}")
+        for p in existing:
+            try:
+                covered_race_ids.update(pd.read_parquet(p, columns=["race_id"])["race_id"].unique())
+            except Exception:
+                pass
+        logger.info(f"  Resumed from cache: {len(existing)} chunks, {len(covered_race_ids)} races already built")
 
-    # Build list of pending batches
+    pending_race_ids = [rid for rid in race_ids if rid not in covered_race_ids]
     pending_batches = [
-        race_ids[i:i + batch_size]
-        for i in range(skip_to, len(race_ids), batch_size)
+        pending_race_ids[i:i + batch_size]
+        for i in range(0, len(pending_race_ids), batch_size)
     ]
 
     if not pending_batches:
         logger.info("  All races already cached")
     else:
-        # True parallel feature building using ProcessPoolExecutor (bypasses GIL)
-        import concurrent.futures
-        import os
-        n_workers = max(1, min(os.cpu_count() or 4, 6))
-        logger.info(f"  Parallel build: {len(pending_batches)} batches, {n_workers} CPU workers")
+        logger.info(f"  Sequential build: {len(pending_batches)} batches")
 
         completed = 0
         chunk_dfs = []
 
-        with concurrent.futures.ProcessPoolExecutor(max_workers=n_workers) as executor:
-            futures = {executor.submit(_build_features_worker, b): i for i, b in enumerate(pending_batches)}
-            for fut in concurrent.futures.as_completed(futures):
-                try:
-                    batch_df = fut.result()
-                    if batch_df is not None and not batch_df.empty:
-                        chunk_dfs.append(batch_df)
-                except Exception as e:
-                    logger.warning(f"  Batch failed: {e}")
-                completed += 1
-                if completed % 10 == 0 or completed == len(pending_batches):
-                    done_races = skip_to + completed * batch_size
-                    logger.info(f"  Progress: {min(done_races, len(race_ids))}/{len(race_ids)} races")
-                    if chunk_dfs:
-                        chunk_path = cache_dir / f"batch_{len(existing):04d}.parquet"
-                        pd.concat(chunk_dfs, ignore_index=True).to_parquet(chunk_path, index=False)
-                        existing.append(chunk_path)
-                        chunk_dfs.clear()
-                        logger.info(f"  Checkpoint saved: {chunk_path.name}")
+        for batch_ids in pending_batches:
+            try:
+                batch_df = build_features_for_races(con, batch_ids)
+                if batch_df is not None and not batch_df.empty:
+                    chunk_dfs.append(batch_df)
+            except Exception as e:
+                logger.warning(f"  Batch failed: {e}")
+            completed += 1
+            if completed % 5 == 0 or completed == len(pending_batches):
+                done_races = len(covered_race_ids) + completed * batch_size
+                logger.info(f"  Progress: {min(done_races, len(race_ids))}/{len(race_ids)} races")
+                if chunk_dfs:
+                    chunk_path = cache_dir / f"batch_{len(existing):04d}.parquet"
+                    pd.concat(chunk_dfs, ignore_index=True).to_parquet(chunk_path, index=False)
+                    existing.append(chunk_path)
+                    chunk_dfs.clear()
+                    logger.info(f"  Checkpoint saved: {chunk_path.name}")
 
         if chunk_dfs:
             chunk_path = cache_dir / f"batch_{len(existing):04d}.parquet"
@@ -1485,15 +1534,21 @@ def build_training_dataset(con: duckdb.DuckDBPyConnection,
             existing.append(chunk_path)
             logger.info(f"  Final checkpoint saved: {chunk_path.name}")
 
-    if not existing:
+    actual_files = sorted(cache_dir.glob("batch_*.parquet"))
+    if not actual_files:
         logger.warning("No features built -- empty dataset")
         return pd.DataFrame()
 
-    logger.info(f"  Loading {len(existing)} checkpoint files...")
+    logger.info(f"  Loading {len(actual_files)} checkpoint files...")
     result = pd.concat(
-        [pd.read_parquet(p) for p in sorted(existing)],
+        [pd.read_parquet(p) for p in actual_files],
         ignore_index=True,
     )
+
+    before_dedup = len(result)
+    result = result.drop_duplicates(subset=["race_id", "horse_name"], keep="last")
+    if len(result) < before_dedup:
+        logger.info(f"  Deduped: {before_dedup:,} -> {len(result):,} (removed {before_dedup - len(result):,})")
 
     result.to_parquet(FEATURE_MATRIX_PATH, index=False)
     logger.info(f"Training dataset: {len(result):,} runners, {len(result.columns)} columns (saved)")
