@@ -322,7 +322,7 @@ export function RunnerRow({ runner, rank }: Props) {
                       </>
                     ) : (
                       <>
-                        {' '}No live bookie odds available yet. Hit <span className="text-gray-400 font-medium">Refresh Odds</span> to fetch latest prices.
+                        {' '}No live bookie odds available yet. Odds are refreshed automatically.
                       </>
                     )}
                   </p>

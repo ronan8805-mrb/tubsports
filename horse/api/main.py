@@ -63,6 +63,7 @@ app.add_middleware(
     allow_origins=[
         "https://tubsports.com",
         "https://www.tubsports.com",
+        "https://api.tubsports.com",
         "http://localhost:5174",
         "http://localhost:5173",
     ],

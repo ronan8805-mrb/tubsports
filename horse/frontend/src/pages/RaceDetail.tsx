@@ -1,63 +1,13 @@
-import { useState, useCallback, useRef, useEffect } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
-import { useQueryClient } from '@tanstack/react-query';
 import { useThirteenD } from '../hooks/useRaceCard';
 import { RunnerRow } from '../components/RunnerRow';
-import { api } from '../services/api';
 
 export function RaceDetail() {
   const { raceId } = useParams<{ raceId: string }>();
   const id = Number(raceId) || 0;
   const navigate = useNavigate();
-  const queryClient = useQueryClient();
 
   const { data, isLoading, error } = useThirteenD(id);
-
-  const [refreshingOdds, setRefreshingOdds] = useState(false);
-  const [oddsMsg, setOddsMsg] = useState<string | null>(null);
-  const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  const stopPolling = useCallback(() => {
-    if (pollRef.current) {
-      clearInterval(pollRef.current);
-      pollRef.current = null;
-    }
-  }, []);
-
-  useEffect(() => {
-    return () => stopPolling();
-  }, [stopPolling]);
-
-  const handleRefreshOdds = useCallback(async () => {
-    try {
-      setRefreshingOdds(true);
-      setOddsMsg(null);
-      await api.triggerOddsRefresh();
-      pollRef.current = setInterval(async () => {
-        try {
-          const status = await api.getOddsStatus();
-          if (!status.running) {
-            stopPolling();
-            setRefreshingOdds(false);
-            if (status.result === 'success') {
-              setOddsMsg('Odds updated!');
-              queryClient.invalidateQueries({ queryKey: ['thirteenD', id] });
-            } else {
-              setOddsMsg(status.error ? `Error: ${status.error}` : 'Done');
-            }
-            setTimeout(() => setOddsMsg(null), 4000);
-          }
-        } catch {
-          stopPolling();
-          setRefreshingOdds(false);
-        }
-      }, 3000);
-    } catch {
-      setRefreshingOdds(false);
-      setOddsMsg('Failed to refresh odds');
-      setTimeout(() => setOddsMsg(null), 4000);
-    }
-  }, [id, queryClient, stopPolling]);
 
   if (isLoading) {
     return (
@@ -142,44 +92,6 @@ export function RaceDetail() {
               {race_info.num_runners} runners
             </span>
           </div>
-        </div>
-
-        {/* Refresh Odds button */}
-        <div className="mt-3 flex items-center gap-3">
-          <button
-            onClick={handleRefreshOdds}
-            disabled={refreshingOdds}
-            className={`inline-flex items-center gap-2 px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${
-              refreshingOdds
-                ? 'bg-gray-700 text-gray-400 cursor-not-allowed'
-                : 'bg-sky-600 hover:bg-sky-500 text-white shadow-lg shadow-sky-500/20'
-            }`}
-          >
-            {refreshingOdds ? (
-              <>
-                <svg className="w-3.5 h-3.5 animate-spin" viewBox="0 0 24 24" fill="none">
-                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
-                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
-                </svg>
-                Refreshing...
-              </>
-            ) : (
-              <>
-                <svg className="w-3.5 h-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor">
-                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
-                </svg>
-                Refresh Odds
-              </>
-            )}
-          </button>
-          {oddsMsg && (
-            <span className={`text-xs font-medium ${
-              oddsMsg.startsWith('Error') || oddsMsg.startsWith('Failed')
-                ? 'text-red-400' : 'text-emerald-400'
-            }`}>
-              {oddsMsg}
-            </span>
-          )}
         </div>
 
       </div>
