@@ -18,6 +18,9 @@ cd /d "%~dp0"
 :: ---- Kill stale processes ----
 echo.
 echo [%TIME%] [1/3] Killing old processes...
+for /f "tokens=5" %%a in ('netstat -ano ^| findstr :8002 ^| findstr LISTENING') do (
+    taskkill /PID %%a /F >nul 2>&1
+)
 taskkill /FI "WINDOWTITLE eq Horse API*" /F >nul 2>&1
 taskkill /FI "WINDOWTITLE eq Horse Frontend*" /F >nul 2>&1
 timeout /t 2 /nobreak >nul
@@ -57,6 +60,9 @@ pause >nul
 
 echo.
 echo [%TIME%] Stopping all services...
+for /f "tokens=5" %%a in ('netstat -ano ^| findstr :8002 ^| findstr LISTENING') do (
+    taskkill /PID %%a /F >nul 2>&1
+)
 taskkill /FI "WINDOWTITLE eq Horse API*" /F >nul 2>&1
 taskkill /FI "WINDOWTITLE eq Horse Frontend*" /F >nul 2>&1
 echo Done.

@@ -182,10 +182,30 @@ def get_races(
             ORDER BY m.course, COALESCE(ra.off_dt, '9999-01-01'), ra.race_number
         """, params).fetchall()
 
+        cache = _load_cache(query_date)
+        cached_races = cache.get("races", {}) if cache else {}
+
+        # Build a lookup: race_id -> actual active runner count from cache
+        cached_runner_counts = {}
+        for rid_str, race_data in cached_races.items():
+            cached_runner_counts[int(rid_str)] = len(race_data.get("runners", []))
+
+        # Races explicitly skipped during precompute (entries only, no jockeys)
+        cached_entries_only = set(cache.get("skipped_race_ids", [])) if cache else set()
+
         races = []
         for r in rows:
+            rid = r[0]
+
+            # Skip races that are entries-only (no jockeys declared)
+            if rid in cached_entries_only:
+                continue
+
+            # Use cached active runner count if available, otherwise DB value
+            num_runners = cached_runner_counts.get(rid, r[11] or 0)
+
             races.append(RaceInfo(
-                race_id=r[0],
+                race_id=rid,
                 meeting_date=str(r[1]),
                 course=r[2] or "",
                 race_number=r[3],
@@ -196,7 +216,7 @@ def get_races(
                 race_class=r[8],
                 going=r[9],
                 surface=r[10],
-                num_runners=r[11] or 0,
+                num_runners=num_runners,
                 region_code=r[12],
             ))
 
@@ -290,6 +310,9 @@ def get_thirteen_d(race_id: int):
             cached_runners = cached_race.get("runners", [])
             runner_api_ids = cached_race.get("runner_api_ids", {})
 
+            # Override num_runners with actual active runner count from cache
+            race_info.num_runners = len(cached_runners)
+
             jt_rows = con.execute("""
                 SELECT horse_name, jockey_name, trainer_name, api_horse_id, silk_url
                 FROM results WHERE race_id = ?
@@ -322,8 +345,8 @@ def get_thirteen_d(race_id: int):
                     place_rank=0,
                     fair_odds=round(1.0 / max(cr.get("win_prob", 0.001), 0.001), 2),
                     dimensions=dim_list,
-                    positive_drivers=[],
-                    negative_drivers=[],
+                    positive_drivers=[DriverItem(**d) for d in cr.get("positive_drivers", [])],
+                    negative_drivers=[DriverItem(**d) for d in cr.get("negative_drivers", [])],
                 ))
 
             runners.sort(key=lambda r: r.win_prob, reverse=True)

@@ -38,6 +38,7 @@ from .config import (
     TIME_DECAY_HALF_LIFE_DAYS, HARD_EXAMPLE_WEIGHT,
     TEST_DAYS as CONFIG_TEST_DAYS,
     VALIDATION_DAYS as CONFIG_VALIDATION_DAYS,
+    CALIBRATION_DAYS as CONFIG_CALIBRATION_DAYS,
     LGB_N_ROUNDS, LGB_EARLY_STOPPING,
     XGB_N_ROUNDS, XGB_EARLY_STOPPING,
 )
@@ -112,12 +113,16 @@ def _prepare_xy(
 
 
 def _temporal_train_test_split(
-    df: pd.DataFrame, test_days: int = 30
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Split by date: last test_days go to test, rest to train."""
+    df: pd.DataFrame, test_days: int = 90,
+    calibration_days: int = CONFIG_CALIBRATION_DAYS,
+) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    """Split by date: train | calibration holdout | test.
+    Calibration set sits between train and test to avoid data leakage
+    when fitting the probability calibrator.
+    Returns (train, calibration, test)."""
     dates = sorted(df["meeting_date"].dropna().unique())
     if len(dates) == 0:
-        return df, pd.DataFrame()
+        return df, pd.DataFrame(), pd.DataFrame()
 
     max_date = dates[-1]
     min_date = dates[0]
@@ -126,22 +131,26 @@ def _temporal_train_test_split(
     if date_range < test_days * 2:
         split_idx = max(1, int(len(dates) * 0.8))
         cutoff = dates[split_idx - 1]
+        cal_cutoff = cutoff
         logger.info(f"Short data range ({date_range}d). 80/20 split at {cutoff}")
     else:
         cutoff = max_date - timedelta(days=test_days)
+        cal_cutoff = max_date - timedelta(days=test_days - calibration_days)
 
     train = df[df["meeting_date"] <= cutoff]
-    test = df[df["meeting_date"] > cutoff]
+    cal_set = df[(df["meeting_date"] > cutoff) & (df["meeting_date"] <= cal_cutoff)]
+    test = df[df["meeting_date"] > cal_cutoff]
 
     if len(train) == 0:
-        logger.warning("Train set empty. Using all data, no test set.")
-        return df, pd.DataFrame()
+        logger.warning("Train set empty. Using all data, no test/cal set.")
+        return df, pd.DataFrame(), pd.DataFrame()
 
     logger.info(
         f"Temporal split: train={len(train):,} (to {cutoff}), "
-        f"test={len(test):,} (after {cutoff})"
+        f"cal={len(cal_set):,} ({cutoff} to {cal_cutoff}), "
+        f"test={len(test):,} (after {cal_cutoff})"
     )
-    return train, test
+    return train, cal_set, test
 
 
 def _compute_sample_weights(
@@ -433,16 +442,27 @@ def purged_walk_forward_cv(
         test_end = test_start + timedelta(days=test_period)
         train_end = test_start - timedelta(days=gap_days)
 
-        train_df = features_df[features_df["meeting_date"] <= train_end]
+        full_train_df = features_df[features_df["meeting_date"] <= train_end]
         test_df = features_df[
             (features_df["meeting_date"] >= test_start)
             & (features_df["meeting_date"] <= test_end)
         ]
 
-        if len(train_df) < 500 or len(test_df) < 50:
+        if len(full_train_df) < 500 or len(test_df) < 50:
             continue
 
+        # Carve a validation set from the END of the training period
+        # for early stopping — never use the test fold for this
+        val_cutoff = train_end - timedelta(days=14)
+        train_df = full_train_df[full_train_df["meeting_date"] <= val_cutoff]
+        val_df = full_train_df[full_train_df["meeting_date"] > val_cutoff]
+
+        if len(train_df) < 200 or len(val_df) < 30:
+            train_df = full_train_df
+            val_df = full_train_df.tail(min(500, len(full_train_df) // 5))
+
         X_train, y_train = _prepare_xy(train_df, target)
+        X_val, y_val = _prepare_xy(val_df, target)
         X_test, y_test = _prepare_xy(test_df, target)
         if len(X_train) == 0 or len(X_test) == 0:
             continue
@@ -452,7 +472,7 @@ def purged_walk_forward_cv(
 
         lgb_params = _get_lgb_params()
         dtrain_lgb = lgb.Dataset(X_train, label=y_train, weight=weights)
-        dval_lgb = lgb.Dataset(X_test, label=y_test)
+        dval_lgb = lgb.Dataset(X_val, label=y_val)
         model_lgb = lgb.train(
             lgb_params, dtrain_lgb, num_boost_round=1000,
             valid_sets=[dval_lgb],
@@ -465,13 +485,14 @@ def purged_walk_forward_cv(
         xgb_params = _get_xgb_params()
         xgb_params["scale_pos_weight"] = neg / max(pos, 1)
         dtrain_xgb = xgb.DMatrix(X_train, label=y_train, weight=weights, feature_names=feature_names)
-        dval_xgb = xgb.DMatrix(X_test, label=y_test, feature_names=feature_names)
+        dval_xgb = xgb.DMatrix(X_val, label=y_val, feature_names=feature_names)
+        dtest_xgb = xgb.DMatrix(X_test, label=y_test, feature_names=feature_names)
         model_xgb = xgb.train(
             xgb_params, dtrain_xgb, num_boost_round=1000,
-            evals=[(dval_xgb, "test")],
+            evals=[(dval_xgb, "val")],
             early_stopping_rounds=50, verbose_eval=0,
         )
-        xgb_p = model_xgb.predict(dval_xgb)
+        xgb_p = model_xgb.predict(dtest_xgb)
 
         oof_indices.extend(X_test.index.tolist())
         oof_preds_lgb.extend(lgb_p.tolist())
@@ -527,7 +548,7 @@ def optuna_tune_xgb(
         logger.error("Optuna not installed. Run: pip install optuna")
         return {}
 
-    train_df, test_df = _temporal_train_test_split(features_df, test_days)
+    train_df, _cal_df, test_df = _temporal_train_test_split(features_df, test_days)
     X_train, y_train = _prepare_xy(train_df, target)
     X_test, y_test = _prepare_xy(test_df, target)
 
@@ -601,7 +622,7 @@ def optuna_tune_lgb(
         logger.error("Optuna not installed")
         return {}
 
-    train_df, test_df = _temporal_train_test_split(features_df, test_days)
+    train_df, _cal_df, test_df = _temporal_train_test_split(features_df, test_days)
     X_train, y_train = _prepare_xy(train_df, target)
     X_test, y_test = _prepare_xy(test_df, target)
 
@@ -682,16 +703,31 @@ def train_model(
     test_days: int = CONFIG_TEST_DAYS,
     hard_example_ids: Optional[set] = None,
     xgb_overrides: Optional[dict] = None,
+    models_to_train: Optional[set] = None,
 ) -> Dict[str, Any]:
-    """Train LightGBM + XGBoost ensemble for horse racing."""
-    logger.info(f"=== Training {target.upper()} model ===")
+    """Train LightGBM + XGBoost ensemble for horse racing.
+    models_to_train: set of model names e.g. {"LightGBM","XGBoost","CatBoost","RandomForest"}.
+    If None, trains all four."""
+    if models_to_train is None:
+        models_to_train = {"LightGBM", "XGBoost", "CatBoost", "RandomForest"}
+    train_lgb = "LightGBM" in models_to_train
+    train_xgb = "XGBoost" in models_to_train
+    train_cb = "CatBoost" in models_to_train
+    train_rf = "RandomForest" in models_to_train
 
-    train_df, test_df = _temporal_train_test_split(features_df, test_days)
+    logger.info(f"=== Training {target.upper()} model ===")
+    logger.info(f"  Models: {', '.join(sorted(models_to_train))}")
+
+    train_df, cal_df, test_df = _temporal_train_test_split(features_df, test_days)
 
     if len(train_df) < 50:
         raise ValueError(f"Only {len(train_df)} training rows. Need more data.")
 
     X_train, y_train = _prepare_xy(train_df, target)
+    X_cal, y_cal = (
+        _prepare_xy(cal_df, target) if len(cal_df) > 0
+        else (pd.DataFrame(), pd.Series(dtype=int))
+    )
     X_test, y_test = (
         _prepare_xy(test_df, target) if len(test_df) > 0
         else (pd.DataFrame(), pd.Series(dtype=int))
@@ -724,118 +760,140 @@ def train_model(
             pass
 
     # ---- LightGBM (CPU) ----
-    lgb_params = _get_lgb_params()
-    if saved_params.get("lgb"):
-        lgb_params.update(saved_params["lgb"])
-        logger.info(f"  LGB using Optuna params: {list(saved_params['lgb'].keys())}")
-    lgb_train = lgb.Dataset(X_train, label=y_train, weight=weights)
-    lgb_valid = lgb.Dataset(X_test, label=y_test) if len(X_test) > 0 else None
+    lgb_model = None
+    if train_lgb:
+        lgb_params = _get_lgb_params()
+        if saved_params.get("lgb"):
+            lgb_params.update(saved_params["lgb"])
+            logger.info(f"  LGB using Optuna params: {list(saved_params['lgb'].keys())}")
+        lgb_train = lgb.Dataset(X_train, label=y_train, weight=weights)
+        lgb_valid = lgb.Dataset(X_cal, label=y_cal) if len(X_cal) > 0 else None
 
-    callbacks = [lgb.log_evaluation(period=100)]
-    if lgb_valid is not None:
-        callbacks.append(lgb.early_stopping(stopping_rounds=lgb_early_stopping))
+        callbacks = [lgb.log_evaluation(period=100)]
+        if lgb_valid is not None:
+            callbacks.append(lgb.early_stopping(stopping_rounds=lgb_early_stopping))
 
-    lgb_model = lgb.train(
-        lgb_params, lgb_train, num_boost_round=lgb_rounds,
-        valid_sets=[lgb_valid] if lgb_valid else None,
-        valid_names=["test"] if lgb_valid else None,
-        callbacks=callbacks,
-    )
-    logger.info(f"LightGBM: {lgb_model.num_trees()} trees (CPU)")
+        lgb_model = lgb.train(
+            lgb_params, lgb_train, num_boost_round=lgb_rounds,
+            valid_sets=[lgb_valid] if lgb_valid else None,
+            valid_names=["val"] if lgb_valid else None,
+            callbacks=callbacks,
+        )
+        logger.info(f"LightGBM: {lgb_model.num_trees()} trees (CPU)")
+    else:
+        logger.info("LightGBM: SKIPPED (not in models_to_train)")
 
     # ---- XGBoost (GPU) ----
-    xgb_params = _get_xgb_params()
-    xgb_params["scale_pos_weight"] = pos_weight
-    if saved_params.get("xgb"):
-        xgb_params.update(saved_params["xgb"])
-        logger.info(f"  XGB using Optuna params: {list(saved_params['xgb'].keys())}")
-    if xgb_overrides:
-        xgb_params.update(xgb_overrides)
+    xgb_model = None
+    if train_xgb:
+        xgb_params = _get_xgb_params()
+        xgb_params["scale_pos_weight"] = pos_weight
+        if saved_params.get("xgb"):
+            xgb_params.update(saved_params["xgb"])
+            logger.info(f"  XGB using Optuna params: {list(saved_params['xgb'].keys())}")
+        if xgb_overrides:
+            xgb_params.update(xgb_overrides)
 
-    dtrain = xgb.DMatrix(X_train, label=y_train, weight=weights,
-                         feature_names=feature_names)
-    dtest = (
-        xgb.DMatrix(X_test, label=y_test, feature_names=feature_names)
-        if len(X_test) > 0 else None
-    )
-
-    evals = [(dtrain, "train")]
-    if dtest is not None:
-        evals.append((dtest, "test"))
-
-    try:
-        xgb_model = xgb.train(
-            xgb_params, dtrain, num_boost_round=xgb_rounds,
-            evals=evals,
-            early_stopping_rounds=xgb_early_stopping if dtest else None,
-            verbose_eval=100,
+        dtrain = xgb.DMatrix(X_train, label=y_train, weight=weights,
+                             feature_names=feature_names)
+        dval_xgb = (
+            xgb.DMatrix(X_cal, label=y_cal, feature_names=feature_names)
+            if len(X_cal) > 0 else None
         )
-    except (OSError, Exception) as e:
-        if xgb_params.get("device") == "cuda":
-            logger.warning(f"XGBoost GPU failed ({e}), falling back to CPU")
-            xgb_params.pop("device", None)
-            xgb_params["tree_method"] = "hist"
-            dtrain = xgb.DMatrix(X_train, label=y_train, weight=weights,
-                                 feature_names=feature_names)
-            dtest = (
-                xgb.DMatrix(X_test, label=y_test, feature_names=feature_names)
-                if len(X_test) > 0 else None
-            )
-            evals = [(dtrain, "train")]
-            if dtest is not None:
-                evals.append((dtest, "test"))
+
+        evals = [(dtrain, "train")]
+        if dval_xgb is not None:
+            evals.append((dval_xgb, "val"))
+
+        try:
             xgb_model = xgb.train(
                 xgb_params, dtrain, num_boost_round=xgb_rounds,
                 evals=evals,
-                early_stopping_rounds=xgb_early_stopping if dtest else None,
+                early_stopping_rounds=xgb_early_stopping if dval_xgb else None,
                 verbose_eval=100,
             )
-        else:
-            raise
-    logger.info(f"XGBoost: {xgb_model.num_boosted_rounds()} rounds")
+        except (OSError, Exception) as e:
+            if xgb_params.get("device") == "cuda":
+                logger.warning(f"XGBoost GPU failed ({e}), falling back to CPU")
+                xgb_params.pop("device", None)
+                xgb_params["tree_method"] = "hist"
+                dtrain = xgb.DMatrix(X_train, label=y_train, weight=weights,
+                                     feature_names=feature_names)
+                dval_xgb = (
+                    xgb.DMatrix(X_cal, label=y_cal, feature_names=feature_names)
+                    if len(X_cal) > 0 else None
+                )
+                evals = [(dtrain, "train")]
+                if dval_xgb is not None:
+                    evals.append((dval_xgb, "val"))
+                xgb_model = xgb.train(
+                    xgb_params, dtrain, num_boost_round=xgb_rounds,
+                    evals=evals,
+                    early_stopping_rounds=xgb_early_stopping if dval_xgb else None,
+                    verbose_eval=100,
+                )
+            else:
+                raise
+        logger.info(f"XGBoost: {xgb_model.num_boosted_rounds()} rounds")
+    else:
+        logger.info("XGBoost: SKIPPED (not in models_to_train)")
+
+    if not lgb_model and not xgb_model:
+        raise ValueError("At least one of LightGBM or XGBoost must be trained")
 
     # ---- CatBoost (optional) ----
     catboost_model = None
-    try:
-        from catboost import CatBoostClassifier, Pool
-        cb_params = _get_catboost_params()
-        cb_train = Pool(X_train, label=y_train, weight=weights)
-        cb_test = Pool(X_test, label=y_test) if len(X_test) > 0 else None
-        catboost_model = CatBoostClassifier(**cb_params)
-        catboost_model.fit(cb_train, eval_set=cb_test, verbose=0)
-        logger.info(f"CatBoost: {catboost_model.tree_count_} trees")
-    except ImportError:
-        logger.info("CatBoost not installed -- skipping (pip install catboost)")
-    except Exception as e:
-        logger.warning(f"CatBoost training failed: {e}")
+    if train_cb:
+        try:
+            from catboost import CatBoostClassifier, Pool
+            cb_params = _get_catboost_params()
+            cb_train = Pool(X_train, label=y_train, weight=weights)
+            cb_val = Pool(X_cal, label=y_cal) if len(X_cal) > 0 else None
+            catboost_model = CatBoostClassifier(**cb_params)
+            catboost_model.fit(cb_train, eval_set=cb_val, verbose=0)
+            logger.info(f"CatBoost: {catboost_model.tree_count_} trees")
+        except ImportError:
+            logger.info("CatBoost not installed -- skipping (pip install catboost)")
+        except Exception as e:
+            logger.warning(f"CatBoost training failed: {e}")
+    else:
+        logger.info("CatBoost: SKIPPED (not in models_to_train)")
 
     # ---- RandomForest ----
     X_train_filled = X_train.fillna(0)
     X_test_filled = X_test.fillna(0) if len(X_test) > 0 else pd.DataFrame()
     rf_model = None
-    try:
-        from sklearn.ensemble import RandomForestClassifier
-        _rf = RandomForestClassifier(
-            n_estimators=500, max_depth=12, min_samples_leaf=20,
-            class_weight="balanced", n_jobs=-1, random_state=42,
-        )
-        _rf.fit(X_train_filled, y_train, sample_weight=weights)
-        rf_model = _rf
-        logger.info(f"RandomForest: {_rf.n_estimators} trees")
-    except Exception as e:
-        logger.warning(f"RandomForest training failed: {e}")
+    if train_rf:
+        try:
+            from sklearn.ensemble import RandomForestClassifier
+            _rf = RandomForestClassifier(
+                n_estimators=500, max_depth=12, min_samples_leaf=20,
+                class_weight="balanced", n_jobs=-1, random_state=42,
+            )
+            _rf.fit(X_train_filled, y_train, sample_weight=weights)
+            rf_model = _rf
+            logger.info(f"RandomForest: {_rf.n_estimators} trees")
+        except Exception as e:
+            logger.warning(f"RandomForest training failed: {e}")
+    else:
+        logger.info("RandomForest: SKIPPED (not in models_to_train)")
 
     # ---- Evaluation + Stacked Meta-Learner ----
     metrics = {}
     active_weights = {}
 
     if len(X_test) > 0 and len(y_test) > 0:
-        lgb_probs = lgb_model.predict(X_test)
-        xgb_probs = xgb_model.predict(
-            xgb.DMatrix(X_test, feature_names=feature_names)
-        )
+        base_models = {}
 
-        base_models = {"lgb": lgb_probs, "xgb": xgb_probs}
+        if lgb_model is not None:
+            lgb_probs = lgb_model.predict(X_test)
+            base_models["lgb"] = lgb_probs
+
+        if xgb_model is not None:
+            xgb_probs = xgb_model.predict(
+                xgb.DMatrix(X_test, feature_names=feature_names)
+            )
+            base_models["xgb"] = xgb_probs
 
         if catboost_model is not None:
             try:
@@ -919,14 +977,19 @@ def train_model(
         )
 
     # ---- Feature importance ----
-    lgb_imp = dict(zip(feature_names, lgb_model.feature_importance(importance_type="gain")))
-    xgb_imp = xgb_model.get_score(importance_type="gain")
-    all_feats = set(list(lgb_imp.keys()) + list(xgb_imp.keys()))
+    imp_sources = {}
+    if lgb_model is not None:
+        imp_sources["lgb"] = dict(zip(feature_names, lgb_model.feature_importance(importance_type="gain")))
+    if xgb_model is not None:
+        imp_sources["xgb"] = xgb_model.get_score(importance_type="gain")
+    all_feats = set()
+    for src in imp_sources.values():
+        all_feats.update(src.keys())
+    n_sources = max(len(imp_sources), 1)
     combined_imp = {}
     for f in all_feats:
-        v1 = lgb_imp.get(f, 0)
-        v2 = xgb_imp.get(f, 0)
-        combined_imp[f] = round(float(v1 + v2) / 2, 2)
+        total = sum(src.get(f, 0) for src in imp_sources.values())
+        combined_imp[f] = round(float(total) / n_sources, 2)
     combined_imp = dict(sorted(combined_imp.items(), key=lambda x: x[1], reverse=True))
 
     logger.info("Top 10 features:")
@@ -935,31 +998,106 @@ def train_model(
 
     # ---- Hard examples ----
     hard_examples = set()
-    try:
-        hard_examples = _identify_hard_examples(
-            lgb_model, xgb_model, feature_names, train_df, target,
-        )
-    except Exception as e:
-        logger.debug(f"Hard example ID skipped: {e}")
+    if lgb_model is not None and xgb_model is not None:
+        try:
+            hard_examples = _identify_hard_examples(
+                lgb_model, xgb_model, feature_names, train_df, target,
+            )
+        except Exception as e:
+            logger.debug(f"Hard example ID skipped: {e}")
 
     test_preds = None
     test_actuals = None
     calibrator = None
+
+    # --- Calibration on SEPARATE holdout (not the eval test set) ---
+    if len(X_cal) > 0 and len(y_cal) > 0:
+        cal_base = {}
+        if lgb_model is not None:
+            cal_base["lgb"] = lgb_model.predict(X_cal)
+        if xgb_model is not None:
+            cal_base["xgb"] = xgb_model.predict(
+                xgb.DMatrix(X_cal, feature_names=feature_names)
+            )
+        if catboost_model is not None:
+            try:
+                cal_base["catboost"] = catboost_model.predict_proba(X_cal)[:, 1]
+            except Exception:
+                pass
+        if rf_model is not None:
+            try:
+                cal_base["rf"] = rf_model.predict_proba(X_cal.fillna(0))[:, 1]
+            except Exception:
+                pass
+
+        ens_cal = np.zeros(len(y_cal))
+        tw = 0.0
+        for mk, w in (active_weights if active_weights else ENSEMBLE_WEIGHTS).items():
+            if mk in cal_base:
+                ens_cal += w * cal_base[mk]
+                tw += w
+        if tw > 0:
+            ens_cal /= tw
+
+        y_cal_arr = np.array(y_cal)
+
+        # Compare Platt (logistic) vs Isotonic calibration
+        from sklearn.linear_model import LogisticRegression as _LR
+        iso_cal = IsotonicRegression(y_min=0.001, y_max=0.999, out_of_bounds="clip")
+        iso_cal.fit(ens_cal, y_cal_arr)
+        iso_brier = brier_score_loss(y_cal_arr, iso_cal.predict(ens_cal))
+
+        platt_cal = _LR(C=1.0, solver="lbfgs", max_iter=1000)
+        platt_cal.fit(ens_cal.reshape(-1, 1), y_cal_arr)
+        platt_preds = platt_cal.predict_proba(ens_cal.reshape(-1, 1))[:, 1]
+        platt_brier = brier_score_loss(y_cal_arr, platt_preds)
+
+        raw_cal_brier = brier_score_loss(y_cal_arr, ens_cal)
+        logger.info(
+            f"  Calibration holdout ({len(y_cal):,} samples): "
+            f"raw Brier={raw_cal_brier:.4f}, "
+            f"isotonic={iso_brier:.4f}, platt={platt_brier:.4f}"
+        )
+
+        if platt_brier < iso_brier:
+            calibrator = platt_cal
+            cal_method = "platt"
+            best_brier = platt_brier
+            logger.info(f"  Selected: Platt scaling (Brier {platt_brier:.4f})")
+        else:
+            calibrator = iso_cal
+            cal_method = "isotonic"
+            best_brier = iso_brier
+            logger.info(f"  Selected: Isotonic regression (Brier {iso_brier:.4f})")
+
+        metrics["calibration"] = {
+            "method": cal_method,
+            "raw_brier": round(float(raw_cal_brier), 4),
+            "calibrated_brier": round(float(best_brier), 4),
+            "iso_brier": round(float(iso_brier), 4),
+            "platt_brier": round(float(platt_brier), 4),
+            "holdout_samples": len(y_cal),
+        }
+
+    # --- Evaluate on held-out test set (unseen by calibrator) ---
     if len(X_test) > 0:
         test_preds = ens_probs
         test_actuals = np.array(y_test)
 
-        calibrator = IsotonicRegression(y_min=0.001, y_max=0.999, out_of_bounds="clip")
-        calibrator.fit(test_preds, test_actuals)
-        calibrated_preds = calibrator.predict(test_preds)
-
-        cal_brier = brier_score_loss(test_actuals, calibrated_preds)
-        raw_brier = metrics.get("ensemble", {}).get("brier", 1.0)
-        logger.info(f"  Calibration: Brier {raw_brier:.4f} -> {cal_brier:.4f}")
-        metrics["calibrated"] = {
-            "brier": round(float(cal_brier), 4),
-            "samples": len(test_actuals),
-        }
+        if calibrator is not None:
+            if hasattr(calibrator, "predict_proba"):
+                cal_test_preds = calibrator.predict_proba(test_preds.reshape(-1, 1))[:, 1]
+            else:
+                cal_test_preds = calibrator.predict(test_preds)
+            cal_brier = brier_score_loss(test_actuals, cal_test_preds)
+            raw_brier = metrics.get("ensemble", {}).get("brier", 1.0)
+            logger.info(f"  Test set calibration: Brier {raw_brier:.4f} -> {cal_brier:.4f}")
+            metrics["calibrated_test"] = {
+                "brier": round(float(cal_brier), 4),
+                "samples": len(test_actuals),
+            }
+    elif len(X_cal) == 0:
+        logger.warning("No calibration or test data — calibrator not fitted")
 
     return {
         "lgb_model": lgb_model,
@@ -967,7 +1105,11 @@ def train_model(
         "catboost_model": catboost_model,
         "rf_model": rf_model,
         "calibrator": calibrator,
-        "ensemble_weights": active_weights if len(X_test) > 0 else ENSEMBLE_WEIGHTS,
+        "ensemble_weights": active_weights if active_weights else {
+            k: v for k, v in ENSEMBLE_WEIGHTS.items()
+            if (k == "lgb" and lgb_model) or (k == "xgb" and xgb_model)
+            or (k == "catboost" and catboost_model) or (k == "rf" and rf_model)
+        },
         "feature_names": feature_names,
         "metrics": metrics,
         "feature_importance": combined_imp,
@@ -1022,10 +1164,12 @@ def save_model(result: Dict[str, Any], suffix: str = "") -> Path:
     model_path.mkdir(parents=True, exist_ok=True)
 
     lgb_path = model_path / "lgb.txt"
-    result["lgb_model"].save_model(str(lgb_path))
+    if result.get("lgb_model") is not None:
+        result["lgb_model"].save_model(str(lgb_path))
 
     xgb_path = model_path / "xgb.json"
-    result["xgb_model"].save_model(str(xgb_path))
+    if result.get("xgb_model") is not None:
+        result["xgb_model"].save_model(str(xgb_path))
 
     if result.get("calibrator") is not None:
         cal_path = model_path / "calibrator.pkl"
@@ -1165,7 +1309,10 @@ def predict_race(
         probs /= total_w
 
     if calibrator is not None:
-        probs = calibrator.predict(probs)
+        if hasattr(calibrator, "predict_proba"):
+            probs = calibrator.predict_proba(probs.reshape(-1, 1))[:, 1]
+        else:
+            probs = calibrator.predict(probs)
 
     prob_col = "win_prob" if target == "win" else "place_prob"
     rank_col = "win_rank" if target == "win" else "place_rank"

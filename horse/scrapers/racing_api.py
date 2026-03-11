@@ -538,6 +538,24 @@ def _ingest_race(con, race_data: dict, index: int):
         raw_json=raw_json,
     )
 
+    # For future races: clear old runners then re-insert from fresh API data.
+    # This handles declarations narrowing the field (e.g., 72 entries -> 22 declared).
+    race_date = None
+    try:
+        race_date = date.fromisoformat(race_date_str) if race_date_str else None
+    except (ValueError, TypeError):
+        pass
+
+    if race_date and race_date >= date.today():
+        old_count = con.execute(
+            "SELECT COUNT(*) FROM results WHERE race_id = ?", [race_id]
+        ).fetchone()[0]
+        if old_count > 0 and old_count != len(runners):
+            con.execute("DELETE FROM results WHERE race_id = ?", [race_id])
+            logger.info(
+                f"  Refreshed runners for {api_race_id}: {old_count} -> {len(runners)}"
+            )
+
     for runner in runners:
         try:
             _ingest_runner(con, race_id, runner)

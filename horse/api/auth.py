@@ -241,22 +241,6 @@ def login(body: LoginRequest):
             _log_security_event(uname, "failed_login", f"Wrong password ({len(attempts)} attempts)")
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    # Device lock check (admin exempt)
-    if role != "admin" and body.device_fingerprint:
-        fp_hash = _hash_fingerprint(body.device_fingerprint)
-        if stored_device is None:
-            con = _get_auth_con()
-            try:
-                con.execute("UPDATE users SET device_hash = ? WHERE user_id = ?", [fp_hash, uid])
-            finally:
-                con.close()
-        elif stored_device != fp_hash:
-            _log_security_event(uname, "device_mismatch", "Login attempt from unregistered device")
-            raise HTTPException(
-                status_code=403,
-                detail="Account locked to another device. Contact admin to reset.",
-            )
-
     _login_attempts.pop(key, None)
     token = _create_token(uid, uname, role)
     return LoginResponse(token=token, username=uname, role=role)

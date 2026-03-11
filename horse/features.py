@@ -462,6 +462,9 @@ def _compute_jt_features(con: duckdb.DuckDBPyConnection,
         feats["jockey_course_win_rate"] = np.nan
 
     # --- Trainer stats (last 365 days) ---
+    cutoff_14 = str(pd.Timestamp(race_date) - pd.Timedelta(days=14))
+    cutoff_30 = str(pd.Timestamp(race_date) - pd.Timedelta(days=30))
+
     if api_trainer_id:
         trow = con.execute("""
             SELECT COUNT(*) AS runs,
@@ -480,6 +483,39 @@ def _compute_jt_features(con: duckdb.DuckDBPyConnection,
         feats["trainer_runs_365d"] = float(runs)
         feats["trainer_win_rate_365d"] = wins / runs if runs > 0 else np.nan
         feats["trainer_place_rate_365d"] = places / runs if runs > 0 else np.nan
+
+        # Trainer short-term form (14 days)
+        t14 = con.execute("""
+            SELECT COUNT(*) AS runs,
+                   SUM(CASE WHEN res.position = 1 THEN 1 ELSE 0 END) AS wins
+            FROM results res
+            JOIN races ra ON res.race_id = ra.race_id
+            JOIN meetings m ON ra.meeting_id = m.meeting_id
+            WHERE res.api_trainer_id = ?
+              AND m.meeting_date >= ? AND m.meeting_date < ?
+              AND res.position IS NOT NULL AND res.position > 0
+        """, [api_trainer_id, cutoff_14, cutoff]).fetchone()
+        r14, w14 = t14 if t14 else (0, 0)
+        r14 = r14 or 0
+        feats["trainer_14day_runs"] = float(r14)
+        feats["trainer_14day_win_rate"] = w14 / r14 if r14 > 0 else np.nan
+
+        # Trainer 30-day level-stakes ROI (backing every runner at SP)
+        t30 = con.execute("""
+            SELECT COUNT(*) AS runs,
+                   SUM(CASE WHEN res.position = 1 THEN res.sp_decimal ELSE 0 END) AS returns
+            FROM results res
+            JOIN races ra ON res.race_id = ra.race_id
+            JOIN meetings m ON ra.meeting_id = m.meeting_id
+            WHERE res.api_trainer_id = ?
+              AND m.meeting_date >= ? AND m.meeting_date < ?
+              AND res.position IS NOT NULL AND res.position > 0
+              AND res.sp_decimal IS NOT NULL AND res.sp_decimal > 0
+        """, [api_trainer_id, cutoff_30, cutoff]).fetchone()
+        r30, ret30 = t30 if t30 else (0, 0)
+        r30 = r30 or 0
+        ret30 = ret30 or 0.0
+        feats["trainer_30day_roi"] = (ret30 / r30 - 1.0) if r30 > 0 else np.nan
 
         if course:
             tc = con.execute("""
@@ -503,6 +539,9 @@ def _compute_jt_features(con: duckdb.DuckDBPyConnection,
         feats["trainer_runs_365d"] = np.nan
         feats["trainer_win_rate_365d"] = np.nan
         feats["trainer_place_rate_365d"] = np.nan
+        feats["trainer_14day_runs"] = np.nan
+        feats["trainer_14day_win_rate"] = np.nan
+        feats["trainer_30day_roi"] = np.nan
         feats["trainer_course_runs"] = np.nan
         feats["trainer_course_win_rate"] = np.nan
 
@@ -1281,12 +1320,58 @@ def build_features_for_races(con: duckdb.DuckDBPyConnection,
             else:
                 df.loc[idx, "exchange_volume_rank"] = np.nan
 
-    # --- Pace scenario (count of front-runners per race) ---
+    # --- Pace features (race-level dynamics) ---
     if "run_style" in df.columns:
         for race_id, group in df.groupby("race_id"):
             idx = group.index
             n_front = (group["run_style"] == 1.0).sum()
+            n_runners = len(group)
             df.loc[idx, "pace_scenario"] = float(n_front)
+
+            # Early speed rank within the race
+            has_sect = "sect_early_pos_avg3" in group.columns and group["sect_early_pos_avg3"].notna().sum() > 0
+            if has_sect:
+                df.loc[idx, "early_speed_rank"] = group["sect_early_pos_avg3"].rank(
+                    ascending=True, method="min"
+                )
+                pace_leaders = (group["sect_early_pos_avg3"].rank(ascending=True, method="min") <= 3).sum()
+                df.loc[idx, "pace_pressure"] = float(pace_leaders)
+            else:
+                df.loc[idx, "early_speed_rank"] = np.nan
+                df.loc[idx, "pace_pressure"] = float(n_front)
+
+            df.loc[idx, "front_runner_count"] = float(n_front)
+
+            # Lead probability: P(this horse leads) from run style + sectionals
+            course_pace = group.get("course_pace_bias")
+            cpb = course_pace.iloc[0] if course_pace is not None and len(course_pace) > 0 and not pd.isna(course_pace.iloc[0]) else 0.5
+            for i_row in idx:
+                style = df.at[i_row, "run_style"] if "run_style" in df.columns else np.nan
+                early_rank = df.at[i_row, "early_speed_rank"] if has_sect else np.nan
+                if pd.isna(style):
+                    df.at[i_row, "lead_probability"] = np.nan
+                    continue
+                base = 0.6 if style == 1.0 else (0.2 if style == 2.0 else 0.05)
+                if not pd.isna(early_rank):
+                    if early_rank == 1:
+                        base = min(base + 0.25, 0.95)
+                    elif early_rank <= 3:
+                        base = min(base + 0.10, 0.80)
+                    else:
+                        base = max(base - 0.05, 0.01)
+                if n_runners > 0:
+                    base *= (1.0 / max(n_front, 1))
+                base = max(0.01, min(0.95, base))
+                df.at[i_row, "lead_probability"] = base
+
+            # Expected pace categorical: 0=slow, 1=even, 2=fast
+            if n_front <= 1:
+                df.loc[idx, "expected_pace"] = 0.0
+            elif n_front <= 3:
+                df.loc[idx, "expected_pace"] = 1.0
+            else:
+                df.loc[idx, "expected_pace"] = 2.0
+
             styles = group["run_style"].dropna()
             if len(styles) > 0:
                 df.loc[idx, "pace_advantage"] = group["run_style"].apply(
@@ -1296,6 +1381,46 @@ def build_features_for_races(con: duckdb.DuckDBPyConnection,
                 )
             else:
                 df.loc[idx, "pace_advantage"] = np.nan
+
+    # --- Finish speed ratio (horse FSP / race avg FSP) ---
+    if "sect_fsp_avg3" in df.columns:
+        for race_id, group in df.groupby("race_id"):
+            idx = group.index
+            fsp_vals = group["sect_fsp_avg3"].dropna()
+            if len(fsp_vals) >= 2:
+                race_avg_fsp = fsp_vals.mean()
+                df.loc[idx, "finish_speed_ratio"] = (
+                    group["sect_fsp_avg3"] / race_avg_fsp
+                ).clip(0.5, 2.0)
+            else:
+                df.loc[idx, "finish_speed_ratio"] = np.nan
+
+    # --- Field strength features ---
+    for race_id, group in df.groupby("race_id"):
+        idx = group.index
+        or_vals = group["official_rating"].dropna()
+        if len(or_vals) >= 2:
+            df.loc[idx, "field_rating_mean"] = or_vals.mean()
+            df.loc[idx, "field_rating_std"] = or_vals.std()
+            df.loc[idx, "rating_vs_field_mean"] = group["official_rating"] - or_vals.mean()
+        else:
+            df.loc[idx, "field_rating_mean"] = np.nan
+            df.loc[idx, "field_rating_std"] = np.nan
+            df.loc[idx, "rating_vs_field_mean"] = np.nan
+
+    # --- Market entropy (how spread is the betting market) ---
+    if "back_odds" in df.columns:
+        for race_id, group in df.groupby("race_id"):
+            idx = group.index
+            valid_odds = group["back_odds"].dropna()
+            valid_odds = valid_odds[valid_odds > 1.0]
+            if len(valid_odds) >= 2:
+                implied = 1.0 / valid_odds
+                probs = implied / implied.sum()
+                entropy = -(probs * np.log(probs + 1e-10)).sum()
+                df.loc[idx, "market_entropy"] = entropy
+            else:
+                df.loc[idx, "market_entropy"] = np.nan
 
     # --- Interaction features ---
     df["or_vs_class"] = df["official_rating"] / df["race_class_numeric"].replace(0, np.nan)
@@ -1390,7 +1515,10 @@ def build_training_dataset(con: duckdb.DuckDBPyConnection,
                           "finish_strength", "sect_gain_x_form",
                           "early_pos_x_distance",
                           "relative_speed_z", "relative_speed_x_form",
-                          "relative_speed_x_distance"}
+                          "relative_speed_x_distance",
+                          "trainer_14day_runs", "trainer_14day_win_rate",
+                          "trainer_30day_roi", "lead_probability",
+                          "finish_speed_ratio"}
     if not full_rebuild and FEATURE_MATRIX_PATH.exists():
         saved_df = pd.read_parquet(FEATURE_MATRIX_PATH)
         missing_cols = _EXPECTED_NEW_COLS - set(saved_df.columns)
@@ -1398,25 +1526,29 @@ def build_training_dataset(con: duckdb.DuckDBPyConnection,
             logger.info(f"  Feature columns changed ({len(missing_cols)} new cols detected) â€” forcing FULL REBUILD")
             full_rebuild = True
 
-    # Auto-detect if sectionals data is newer than the saved matrix -> force rebuild.
-    # Prevents stale sectional features silently persisting after new data is imported.
+    # Detect races with new sectional data — refresh only those, not full rebuild
+    _sect_refresh_race_ids: set = set()
     if not full_rebuild and FEATURE_MATRIX_PATH.exists():
         try:
+            import datetime as _dt
             matrix_mtime = FEATURE_MATRIX_PATH.stat().st_mtime
             row = con.execute("SELECT MAX(scraped_at) FROM sectionals").fetchone()
             last_sect_ts = row[0] if row and row[0] else None
             if last_sect_ts is not None:
-                import datetime as _dt
                 if hasattr(last_sect_ts, "timestamp"):
                     sect_mtime = last_sect_ts.timestamp()
                 else:
                     sect_mtime = _dt.datetime.fromisoformat(str(last_sect_ts)).timestamp()
                 if sect_mtime > matrix_mtime:
+                    matrix_dt = _dt.datetime.fromtimestamp(matrix_mtime)
+                    sect_rows = con.execute(
+                        "SELECT DISTINCT race_id FROM sectionals WHERE scraped_at > ?",
+                        [matrix_dt]
+                    ).fetchall()
+                    _sect_refresh_race_ids = {r[0] for r in sect_rows}
                     logger.info(
-                        f"  Sectionals updated after saved matrix "
-                        f"({last_sect_ts}) — forcing FULL REBUILD"
+                        f"  Sectionals updated: {len(_sect_refresh_race_ids)} races need refresh (incremental)"
                     )
-                    full_rebuild = True
         except Exception as _e:
             logger.debug(f"  Sectionals freshness check skipped: {_e}")
 
@@ -1425,6 +1557,13 @@ def build_training_dataset(con: duckdb.DuckDBPyConnection,
         saved_df = pd.read_parquet(FEATURE_MATRIX_PATH)
         saved_race_ids = set(saved_df["race_id"].unique())
         logger.info(f"  Saved matrix: {len(saved_df):,} runners, {len(saved_race_ids):,} races")
+
+        if _sect_refresh_race_ids:
+            stale_ids = _sect_refresh_race_ids & saved_race_ids
+            if stale_ids:
+                saved_df = saved_df[~saved_df["race_id"].isin(stale_ids)]
+                saved_race_ids -= stale_ids
+                logger.info(f"  Dropped {len(stale_ids)} stale races for sectional refresh")
 
         all_race_ids = [r[0] for r in con.execute("""
             SELECT ra.race_id

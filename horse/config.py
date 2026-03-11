@@ -144,8 +144,9 @@ RESULTS_DIR = DATA_DIR / "results"
 # Training config (15-year rolling window)
 # ---------------------------------------------------------------------------
 TRAIN_YEARS = 5
-TEST_DAYS = 30
+TEST_DAYS = 90
 VALIDATION_DAYS = 60
+CALIBRATION_DAYS = 30
 TIME_DECAY_HALF_LIFE_DAYS = 365
 HARD_EXAMPLE_WEIGHT = 2.0
 

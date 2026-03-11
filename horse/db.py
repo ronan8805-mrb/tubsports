@@ -656,12 +656,28 @@ def upsert_meeting(con, course: str, meeting_date, country: str = "GB",
 
 def upsert_race_by_api_id(con, api_race_id: str, meeting_id: int,
                           **kw) -> int:
-    """Insert or return existing race. Keyed by api_race_id (globally unique)."""
+    """Insert or update existing race. Keyed by api_race_id (globally unique).
+    On re-scrape, updates num_runners, raw_json, going, and race_time so
+    declarations and going changes are picked up."""
     row = con.execute(
         "SELECT race_id FROM races WHERE api_race_id = ?", [api_race_id]
     ).fetchone()
     if row:
-        return row[0]
+        rid = row[0]
+        con.execute("""
+            UPDATE races SET
+                num_runners = COALESCE(?, num_runners),
+                raw_json = COALESCE(?, raw_json),
+                going_description = COALESCE(?, going_description),
+                race_time = COALESCE(?, race_time),
+                non_runners_text = COALESCE(?, non_runners_text)
+            WHERE race_id = ?
+        """, [
+            kw.get("num_runners"), kw.get("raw_json"),
+            kw.get("going_description"), kw.get("race_time"),
+            kw.get("non_runners_text"), rid,
+        ])
+        return rid
 
     rid = con.execute("SELECT nextval('seq_race_id')").fetchone()[0]
     con.execute("""
@@ -793,15 +809,61 @@ def upsert_trainer_by_api_id(con, api_id: str, name: str,
 def insert_result_from_api(con, race_id: int, runner: dict,
                            horse_id: int, jockey_id: int,
                            trainer_id: int) -> int:
-    """Insert a single runner result from Racing API data.
-    Idempotent: skips if (race_id, horse_name) already exists."""
+    """Insert or update a runner result from Racing API data.
+    If the runner already exists but has no position (racecard entry),
+    update it with fresh data (declarations, results)."""
     horse_name = runner.get("horse", "")
     row = con.execute(
-        "SELECT result_id FROM results WHERE race_id = ? AND horse_name = ?",
+        "SELECT result_id, position FROM results WHERE race_id = ? AND horse_name = ?",
         [race_id, horse_name]
     ).fetchone()
     if row:
-        return row[0]
+        existing_id, existing_pos = row
+        new_pos = runner.get("position")
+        new_jockey = runner.get("jockey", "")
+        has_new_result_data = new_pos and str(new_pos).strip().isdigit()
+        has_new_jockey = bool(new_jockey and new_jockey.strip()
+                              and new_jockey.strip().upper() not in ("NON-RUNNER",))
+        needs_update = (existing_pos is None and has_new_result_data) or has_new_jockey
+
+        if needs_update:
+            sp_dec = runner.get("sp_dec")
+            try:
+                sp_dec = float(sp_dec) if sp_dec else None
+            except (ValueError, TypeError):
+                sp_dec = None
+            bsp = runner.get("bsp")
+            try:
+                bsp = float(bsp) if bsp else None
+            except (ValueError, TypeError):
+                bsp = None
+            con.execute("""
+                UPDATE results SET
+                    position = COALESCE(?, position),
+                    sp = COALESCE(?, sp),
+                    sp_decimal = COALESCE(?, sp_decimal),
+                    betfair_sp = COALESCE(?, betfair_sp),
+                    jockey_name = COALESCE(?, jockey_name),
+                    trainer_name = COALESCE(?, trainer_name),
+                    jockey_id = CASE WHEN ? > 0 THEN ? ELSE jockey_id END,
+                    trainer_id = CASE WHEN ? > 0 THEN ? ELSE trainer_id END,
+                    comment = COALESCE(?, comment),
+                    silk_url = COALESCE(?, silk_url),
+                    raw_json = COALESCE(?, raw_json)
+                WHERE result_id = ?
+            """, [
+                int(new_pos) if has_new_result_data else None,
+                runner.get("sp"), sp_dec, bsp,
+                new_jockey if has_new_jockey else None,
+                runner.get("trainer"),
+                jockey_id, jockey_id,
+                trainer_id, trainer_id,
+                runner.get("comment"),
+                runner.get("silk_url"),
+                json.dumps(runner) if runner else None,
+                existing_id,
+            ])
+        return existing_id
 
     resid = con.execute("SELECT nextval('seq_result_id')").fetchone()[0]
 
