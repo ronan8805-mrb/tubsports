@@ -149,6 +149,8 @@ VALIDATION_DAYS = 60
 CALIBRATION_DAYS = 60
 TIME_DECAY_HALF_LIFE_DAYS = 365
 HARD_EXAMPLE_WEIGHT = 2.0
+ANCHOR_EXAMPLE_WEIGHT = 1.5   # correct high-confidence prediction → reinforce pattern
+MAX_ANCHOR_EXAMPLES = 5000    # cap total anchors to prevent accumulation over long runs
 
 # LightGBM / XGBoost
 LGB_N_ROUNDS = 4000

@@ -35,7 +35,7 @@ import pickle
 
 from .config import (
     DATA_DIR, MAX_DAYS_LOOKBACK,
-    TIME_DECAY_HALF_LIFE_DAYS, HARD_EXAMPLE_WEIGHT,
+    TIME_DECAY_HALF_LIFE_DAYS, HARD_EXAMPLE_WEIGHT, ANCHOR_EXAMPLE_WEIGHT,
     TEST_DAYS as CONFIG_TEST_DAYS,
     VALIDATION_DAYS as CONFIG_VALIDATION_DAYS,
     CALIBRATION_DAYS as CONFIG_CALIBRATION_DAYS,
@@ -157,8 +157,9 @@ def _compute_sample_weights(
     df: pd.DataFrame,
     half_life_days: int = TIME_DECAY_HALF_LIFE_DAYS,
     hard_example_ids: Optional[set] = None,
+    anchor_example_ids: Optional[set] = None,
 ) -> np.ndarray:
-    """Time-decay weighting with hard-example boosting."""
+    """Time-decay weighting with hard-example boosting and anchor reinforcement."""
     if "meeting_date" not in df.columns:
         return np.ones(len(df))
 
@@ -173,10 +174,15 @@ def _compute_sample_weights(
     weights = np.exp(-age_days * decay)
     weights = np.clip(weights, 0.001, 1.0)
 
-    if hard_example_ids and "race_id" in df.columns:
+    if "race_id" in df.columns:
+        # Pre-convert to sets for O(1) membership checks on large datasets
+        hard_set = hard_example_ids or set()
+        anchor_set = anchor_example_ids or set()
         for i, rid in enumerate(df["race_id"].values):
-            if rid in hard_example_ids:
+            if rid in hard_set:
                 weights[i] *= HARD_EXAMPLE_WEIGHT
+            if rid in anchor_set:
+                weights[i] *= ANCHOR_EXAMPLE_WEIGHT
 
     logger.info(
         f"Sample weights: mean={weights.mean():.3f}, "
@@ -702,6 +708,7 @@ def train_model(
     xgb_early_stopping: int = XGB_EARLY_STOPPING,
     test_days: int = CONFIG_TEST_DAYS,
     hard_example_ids: Optional[set] = None,
+    anchor_example_ids: Optional[set] = None,
     xgb_overrides: Optional[dict] = None,
     models_to_train: Optional[set] = None,
 ) -> Dict[str, Any]:
@@ -745,6 +752,7 @@ def train_model(
     weights = _compute_sample_weights(
         train_df.loc[X_train.index],
         hard_example_ids=hard_example_ids,
+        anchor_example_ids=anchor_example_ids,
     )
     if len(weights) != len(X_train):
         weights = np.ones(len(X_train))
@@ -996,15 +1004,16 @@ def train_model(
     for i, (feat, imp) in enumerate(list(combined_imp.items())[:10]):
         logger.info(f"  {i + 1}. {feat}: {imp:.2f}")
 
-    # ---- Hard examples ----
-    hard_examples = set()
+    # ---- Hard + anchor examples ----
+    hard_examples: set = set()
+    anchor_examples: set = set()
     if lgb_model is not None and xgb_model is not None:
         try:
-            hard_examples = _identify_hard_examples(
+            hard_examples, anchor_examples = _identify_hard_examples(
                 lgb_model, xgb_model, feature_names, train_df, target,
             )
         except Exception as e:
-            logger.debug(f"Hard example ID skipped: {e}")
+            logger.debug(f"Hard/anchor example ID skipped: {e}")
 
     test_preds = None
     test_actuals = None
@@ -1117,6 +1126,7 @@ def train_model(
         "train_size": len(X_train),
         "test_size": len(X_test),
         "hard_examples": hard_examples,
+        "anchor_examples": anchor_examples,
         "test_predictions": test_preds,
         "test_actuals": test_actuals,
     }
@@ -1126,11 +1136,17 @@ def _identify_hard_examples(
     lgb_model, xgb_model, feature_names,
     train_df: pd.DataFrame, target: str,
     threshold_high: float = 0.40, threshold_low: float = 0.08,
-) -> set:
-    """Find races the model got very wrong for boosting next cycle."""
+) -> tuple[set, set]:
+    """Find races the model got very wrong (hard) or very right (anchor).
+
+    Returns (hard_ids, anchor_ids) for use in sample weighting next cycle.
+    Hard examples are penalised; anchor examples reinforce reliable patterns.
+    """
+    from .config import MAX_ANCHOR_EXAMPLES
+
     X, y = _prepare_xy(train_df, target)
     if len(X) == 0 or "race_id" not in train_df.columns:
-        return set()
+        return set(), set()
 
     lgb_probs = lgb_model.predict(X)
     xgb_probs = xgb_model.predict(xgb.DMatrix(X, feature_names=feature_names))
@@ -1140,16 +1156,31 @@ def _identify_hard_examples(
     valid = valid[valid[TARGET_COL] > 0]
     race_ids = valid["race_id"].values[:len(probs)]
 
-    hard_ids = set()
+    # Percentile threshold for anchors — adapts as model calibration improves
+    anchor_threshold = float(np.percentile(probs, 90))
+
+    hard_ids: set = set()
+    anchor_ids: set = set()
     for i in range(len(probs)):
         actual_pos = y.iloc[i] == 1
-        if probs[i] > threshold_high and not actual_pos:
-            hard_ids.add(int(race_ids[i]))
-        elif probs[i] < threshold_low and actual_pos:
-            hard_ids.add(int(race_ids[i]))
+        p = float(probs[i])
+        rid = int(race_ids[i])
+
+        if p > threshold_high and not actual_pos:   # confident, WRONG → hard
+            hard_ids.add(rid)
+        elif p < threshold_low and actual_pos:       # low confidence, actually WON → hard
+            hard_ids.add(rid)
+        elif p > anchor_threshold and actual_pos:    # confident, CORRECT → anchor
+            anchor_ids.add(rid)
+
+    # Merge with historical anchors, then apply cap (fresh anchors are never dropped)
+    anchor_ids = anchor_ids.union(load_anchor_examples())
+    anchor_ids = set(list(anchor_ids)[:MAX_ANCHOR_EXAMPLES])
+    _save_anchor_examples(anchor_ids)
 
     logger.info(f"Hard examples: {len(hard_ids)} races for {target}")
-    return hard_ids
+    logger.info(f"Anchor examples: {len(anchor_ids)} races for {target} (threshold={anchor_threshold:.3f})")
+    return hard_ids, anchor_ids
 
 
 # ---------------------------------------------------------------------------
@@ -1333,18 +1364,22 @@ def train_all(
     features_df: pd.DataFrame,
     test_days: int = CONFIG_TEST_DAYS,
     hard_example_ids: Optional[set] = None,
+    anchor_example_ids: Optional[set] = None,
 ) -> Dict[str, Any]:
     """Train both WIN and PLACE models. Save to disk."""
     results = {}
-    all_hard = set()
+    all_hard: set = set()
+    all_anchors: set = set()
 
     for target in ["win", "place"]:
         result = train_model(
             features_df, target=target, test_days=test_days,
             hard_example_ids=hard_example_ids,
+            anchor_example_ids=anchor_example_ids,
         )
         path = save_model(result)
         all_hard.update(result.get("hard_examples", set()))
+        all_anchors.update(result.get("anchor_examples", set()))
 
         results[target] = {
             "path": str(path),
@@ -1379,6 +1414,33 @@ def load_hard_examples() -> set:
     try:
         if _HARD_EXAMPLES_PATH.exists():
             data = json.loads(_HARD_EXAMPLES_PATH.read_text(encoding="utf-8"))
+            return set(int(x) for x in data)
+    except Exception:
+        pass
+    return set()
+
+
+# ---------------------------------------------------------------------------
+# Anchor example persistence
+# ---------------------------------------------------------------------------
+
+_ANCHOR_EXAMPLES_PATH = MODEL_DIR / "anchor_examples.json"
+
+
+def _save_anchor_examples(anchor_ids: set) -> None:
+    try:
+        _ANCHOR_EXAMPLES_PATH.write_text(
+            json.dumps(list(anchor_ids), default=int), encoding="utf-8"
+        )
+        logger.info(f"Saved {len(anchor_ids)} anchor examples")
+    except Exception as e:
+        logger.debug(f"Could not save anchor examples: {e}")
+
+
+def load_anchor_examples() -> set:
+    try:
+        if _ANCHOR_EXAMPLES_PATH.exists():
+            data = json.loads(_ANCHOR_EXAMPLES_PATH.read_text(encoding="utf-8"))
             return set(int(x) for x in data)
     except Exception:
         pass

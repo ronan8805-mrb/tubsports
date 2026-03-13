@@ -71,7 +71,7 @@ def main():
     from horse.models import (
         train_model, save_model, audit_leakage, time_based_cv,
         purged_walk_forward_cv, run_optuna_tuning,
-        load_hard_examples, MODEL_DIR,
+        load_hard_examples, load_anchor_examples, MODEL_DIR,
     )
 
     logger.info("=" * 60)
@@ -205,10 +205,13 @@ def main():
         except Exception as e:
             logger.warning(f"Optuna tuning failed: {e}")
 
-    # Load hard examples from previous cycle
+    # Load hard + anchor examples from previous cycle
     hard_ids = load_hard_examples()
+    anchor_ids = load_anchor_examples()
     if hard_ids:
         logger.info(f"Loaded {len(hard_ids)} hard examples from previous cycle")
+    if anchor_ids:
+        logger.info(f"Loaded {len(anchor_ids)} anchor examples from previous cycle")
 
     # Train models for each requested target
     results = {}
@@ -217,6 +220,7 @@ def main():
         logger.info("Training WIN model...")
         t0 = time.time()
         win = train_model(df, target="win", hard_example_ids=hard_ids,
+                          anchor_example_ids=anchor_ids,
                           models_to_train=requested_models)
         logger.info(f"WIN done in {time.time() - t0:.0f}s")
         if args.save_models:
@@ -227,6 +231,7 @@ def main():
         logger.info("Training PLACE model...")
         t0 = time.time()
         place = train_model(df, target="place", hard_example_ids=hard_ids,
+                            anchor_example_ids=anchor_ids,
                             models_to_train=requested_models)
         logger.info(f"PLACE done in {time.time() - t0:.0f}s")
         if args.save_models:
