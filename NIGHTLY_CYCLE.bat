@@ -12,7 +12,7 @@ echo ======================================================================
 echo.
 echo   1. Scrape today's results
 echo   2. Reconcile predictions vs actuals
-echo   3. Fetch tomorrow's racecards
+echo   3. Fetch tomorrow's racecards (backfill + full Racing API racecard)
 echo   4. Scrape RacingTV sectional timing (last 3 days)
 echo   5. Enrich derived stats (damsire, ratings, courses, jockey/trainer)
 echo   6. Incremental retrain (stacked ensemble)
@@ -38,7 +38,13 @@ if errorlevel 1 echo [%TIME%] WARNING: Reconcile had errors
 echo.
 echo [%TIME%] Step 3: Fetching tomorrow's racecards...
 python -u -m horse.scrapers.backfill --phase 8
-if errorlevel 1 echo [%TIME%] WARNING: Racecard fetch had errors
+if errorlevel 1 echo [%TIME%] WARNING: Racecard fetch (backfill) had errors
+
+:: Step 3b: Fetch upcoming racecards via Racing API (full racecard data incl. race times)
+echo.
+echo [%TIME%] Step 3b: Fetching upcoming racecards via Racing API...
+python -u -c "from horse.scrapers.racing_api import RacingAPIClient, fetch_upcoming_racecards; c=RacingAPIClient(); fetch_upcoming_racecards(c); print('  Racecards fetched OK')"
+if errorlevel 1 echo [%TIME%] WARNING: Upcoming racecard fetch had errors
 
 :: ---- Step 4: Scrape RacingTV sectional timing ----
 echo.
