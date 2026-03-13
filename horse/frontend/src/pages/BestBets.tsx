@@ -92,6 +92,48 @@ function PickCard({ pick, rank, isNap }: { pick: BestBetRunner; rank: number; is
         </div>
       </div>
 
+      {pick.back_odds && (
+        <div className="flex items-center gap-3 mt-4 px-3 py-2 bg-gray-900/60 rounded-xl flex-wrap">
+          <span className={`text-xs font-bold px-2 py-0.5 rounded-md ${
+            pick.value_flag === 'VALUE'
+              ? 'bg-emerald-600/20 text-emerald-400'
+              : pick.value_flag === 'SHORT'
+              ? 'bg-orange-600/20 text-orange-400'
+              : 'bg-gray-700/50 text-gray-400'
+          }`}>
+            {pick.value_flag}
+          </span>
+          <span className="text-sm font-semibold text-white">
+            @ {pick.back_odds.toFixed(2)}
+          </span>
+          {pick.morning_price && pick.morning_price !== pick.back_odds && (
+            <span className={`text-xs font-medium ${
+              (pick.market_move_pct ?? 0) > 0 ? 'text-emerald-400' : 'text-red-400'
+            }`}>
+              {(pick.market_move_pct ?? 0) > 0 ? '▼' : '▲'} from {pick.morning_price.toFixed(2)}
+              {pick.steam_flag && (
+                <span className="ml-1 bg-emerald-500/20 text-emerald-300 text-[10px] font-bold px-1.5 py-0.5 rounded-full">
+                  STEAM
+                </span>
+              )}
+            </span>
+          )}
+          <span className="text-gray-600 text-xs">·</span>
+          <span className="text-xs text-gray-500">
+            Harmony{' '}
+            <span className={`font-semibold ${
+              (pick.harmony_score ?? 0) >= 80
+                ? 'text-emerald-400'
+                : (pick.harmony_score ?? 0) >= 60
+                ? 'text-yellow-400'
+                : 'text-red-400'
+            }`}>
+              {pick.harmony_score != null ? `${pick.harmony_score.toFixed(0)}%` : '—'}
+            </span>
+          </span>
+        </div>
+      )}
+
       <div className="flex items-center gap-4 mt-4 text-xs text-gray-400">
         {pick.jockey && (
           <span><span className="text-gray-600">J:</span> {pick.jockey}</span>

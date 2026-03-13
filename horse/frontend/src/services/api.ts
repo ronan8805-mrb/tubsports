@@ -261,6 +261,11 @@ export interface BestBetRunner {
   fair_odds: number;
   back_odds: number | null;
   value_flag: string | null;
+  harmony_score?: number | null;
+  implied_prob?: number | null;
+  morning_price?: number | null;
+  market_move_pct?: number | null;
+  steam_flag?: boolean | null;
   jockey: string | null;
   trainer: string | null;
   official_rating: number | null;

@@ -45,14 +45,16 @@ def copy_actual_results() -> int:
     try:
         placeholders = ",".join(["?"] * len(race_ids))
         actuals = main_con.execute(f"""
-            SELECT r.race_id, r.horse_name, r.position, r.sp_decimal,
+            SELECT r.race_id,
+                   REGEXP_REPLACE(r.horse_name, ' \\([A-Z]+\\)$', '') AS horse_name,
+                   r.position, r.sp_decimal,
                    ra.num_runners, m.meeting_date, m.course
             FROM results r
             JOIN races ra ON r.race_id = ra.race_id
             JOIN meetings m ON ra.meeting_id = m.meeting_id
             WHERE r.race_id IN ({placeholders})
               AND r.position IS NOT NULL
-              AND r.position > 0
+              AND TRY_CAST(r.position AS INTEGER) > 0
         """, race_ids).fetchall()
     finally:
         main_con.close()

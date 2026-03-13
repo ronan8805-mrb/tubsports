@@ -97,6 +97,11 @@ class BestBetRunner(BaseModel):
     fair_odds: float = 0.0
     back_odds: Optional[float] = None
     value_flag: Optional[str] = None
+    harmony_score: Optional[float] = None
+    implied_prob: Optional[float] = None
+    morning_price: Optional[float] = None
+    market_move_pct: Optional[float] = None
+    steam_flag: Optional[bool] = None
     jockey: Optional[str] = None
     trainer: Optional[str] = None
     official_rating: Optional[int] = None

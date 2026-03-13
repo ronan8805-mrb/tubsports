@@ -1290,27 +1290,47 @@ def fetch_upcoming_racecards(client: RacingAPIClient):
 
 
 def _upsert_odds(con, internal_race_id: int, horse_name: str, back: float):
-    """Upsert a single runner's odds into market_data."""
+    """Upsert a single runner's odds into market_data.
+
+    First fetch of the day stores morning_price as the baseline.
+    Subsequent fetches calculate market_move_pct and set steam_flag
+    when odds have shortened by more than 15%.
+    """
     existing = con.execute(
-        "SELECT market_id FROM market_data WHERE race_id = ? AND horse_name = ?",
+        """SELECT market_id, morning_price, back_odds
+           FROM market_data WHERE race_id = ? AND horse_name = ?""",
         [internal_race_id, horse_name]
     ).fetchone()
 
     if existing:
+        market_id, morning_price, prev_back = existing
+
+        # Keep the earliest price of the day as morning baseline
+        if morning_price is None or morning_price <= 1.0:
+            morning_price = prev_back if (prev_back and prev_back > 1.0) else back
+
+        # Movement: positive = odds shortened (money in), negative = drifted
+        move_pct = round((morning_price - back) / morning_price * 100, 2) if morning_price else 0.0
+        steam = move_pct >= 15.0  # shortened 15%+ = steaming
+
         con.execute("""
             UPDATE market_data
-            SET back_odds = ?, captured_at = current_timestamp
+            SET back_odds = ?,
+                morning_price = ?,
+                market_move_pct = ?,
+                steam_flag = ?,
+                captured_at = current_timestamp
             WHERE market_id = ?
-        """, [back, existing[0]])
+        """, [back, morning_price, move_pct, steam, market_id])
     else:
         mid = con.execute(
             "SELECT nextval('seq_market_id')"
         ).fetchone()[0]
         con.execute("""
             INSERT INTO market_data (market_id, race_id, horse_name,
-                back_odds, captured_at)
-            VALUES (?, ?, ?, ?, current_timestamp)
-        """, [mid, internal_race_id, horse_name, back])
+                back_odds, morning_price, market_move_pct, steam_flag, captured_at)
+            VALUES (?, ?, ?, ?, ?, 0.0, FALSE, current_timestamp)
+        """, [mid, internal_race_id, horse_name, back, back])
 
 
 def fetch_odds_for_race(client: RacingAPIClient, api_race_id: str,
