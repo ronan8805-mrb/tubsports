@@ -4,12 +4,23 @@ import { motion } from 'framer-motion';
 import { api } from '../services/api';
 import type { PerformanceSummary } from '../services/api';
 
+function toLocalDateString(d: Date) {
+  return d.toISOString().split('T')[0];
+}
+
+const TODAY = toLocalDateString(new Date());
+const YESTERDAY = toLocalDateString(new Date(Date.now() - 86_400_000));
+
 export function Performance() {
   const [days, setDays] = useState(30);
+  const [dateFilter, setDateFilter] = useState<string>('');
+
+  // When a specific date is selected we need enough history to cover it
+  const daysToFetch = days;
 
   const { data, isLoading, error } = useQuery({
-    queryKey: ['performance', days],
-    queryFn: () => api.getPerformance(days),
+    queryKey: ['performance', daysToFetch],
+    queryFn: () => api.getPerformance(daysToFetch),
     staleTime: 60_000,
   });
 
@@ -18,6 +29,22 @@ export function Performance() {
     queryFn: () => api.getPerformanceSummary(),
     staleTime: 60_000,
   });
+
+  // Filter daily rows by selected date
+  const filteredDaily = dateFilter
+    ? (data?.daily || []).filter((d) => d.date === dateFilter)
+    : (data?.daily || []);
+
+  // Aggregate stats from filtered daily rows (used when date filter is active)
+  const filteredStats = dateFilter && filteredDaily.length > 0
+    ? {
+        wins: filteredDaily.reduce((s, d) => s + d.top_pick_wins, 0),
+        places: filteredDaily.reduce((s, d) => s + d.top_pick_places, 0),
+        total: filteredDaily.reduce((s, d) => s + d.top_pick_total, 0),
+        races: filteredDaily.reduce((s, d) => s + d.races, 0),
+        roi: filteredDaily.reduce((s, d) => s + d.roi_pct, 0) / filteredDaily.length,
+      }
+    : null;
 
   if (isLoading) {
     return (
@@ -67,54 +94,115 @@ export function Performance() {
 
   const { top_pick, top_3_picks, roi, calibration, daily, courses } = data;
 
+  // Stats to display — either filtered-day or full rolling window
+  const displayWinRate = filteredStats
+    ? filteredStats.total > 0 ? filteredStats.wins / filteredStats.total : 0
+    : top_pick.win_rate;
+  const displayPlaceRate = filteredStats
+    ? filteredStats.total > 0 ? filteredStats.places / filteredStats.total : 0
+    : top_pick.place_rate;
+  const displayWins = filteredStats ? filteredStats.wins : top_pick.wins;
+  const displayPlaces = filteredStats ? filteredStats.places : top_pick.places;
+  const displayTotal = filteredStats ? filteredStats.total : top_pick.total;
+  const displayRoi = filteredStats ? filteredStats.roi : roi.roi_pct;
+
   return (
     <div className="max-w-5xl mx-auto px-4 py-6">
       {/* Header */}
-      <div className="flex items-center justify-between mb-6">
+      <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-4 mb-6">
         <div>
           <h1 className="text-2xl font-bold text-white">Performance</h1>
           <p className="text-sm text-gray-500">
-            Prediction track record -- {data.total_races} races, {data.total_predictions} predictions
+            {dateFilter
+              ? `Showing results for ${dateFilter}`
+              : `Prediction track record — ${data.total_races} races, ${data.total_predictions} predictions`}
           </p>
         </div>
-        <select
-          value={days}
-          onChange={(e) => setDays(Number(e.target.value))}
-          className="bg-gray-800 border border-gray-700 text-gray-200 rounded-lg px-3 py-2 text-sm"
-        >
-          <option value={7}>Last 7 days</option>
-          <option value={14}>Last 14 days</option>
-          <option value={30}>Last 30 days</option>
-          <option value={90}>Last 90 days</option>
-          <option value={365}>Last year</option>
-        </select>
+        <div className="flex items-center gap-2 flex-wrap">
+          {/* Quick date buttons */}
+          <button
+            onClick={() => { setDateFilter(TODAY); setDays(7); }}
+            className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${
+              dateFilter === TODAY
+                ? 'bg-blue-600 text-white'
+                : 'bg-gray-800 text-gray-400 hover:text-white hover:bg-gray-700'
+            }`}
+          >
+            Today
+          </button>
+          <button
+            onClick={() => { setDateFilter(YESTERDAY); setDays(7); }}
+            className={`px-3 py-1.5 rounded-lg text-xs font-medium transition-all ${
+              dateFilter === YESTERDAY
+                ? 'bg-emerald-600 text-white'
+                : 'bg-gray-800 text-gray-400 hover:text-white hover:bg-gray-700'
+            }`}
+          >
+            Yesterday
+          </button>
+          <input
+            type="date"
+            value={dateFilter}
+            max={TODAY}
+            onChange={(e) => { setDateFilter(e.target.value); setDays(90); }}
+            className="bg-gray-800 border border-gray-700 text-gray-200 rounded-lg px-3 py-1.5 text-xs focus:outline-none focus:ring-2 focus:ring-emerald-500/50"
+          />
+          {dateFilter && (
+            <button
+              onClick={() => setDateFilter('')}
+              className="px-3 py-1.5 rounded-lg text-xs font-medium bg-gray-700 text-gray-300 hover:bg-gray-600"
+            >
+              Clear
+            </button>
+          )}
+          {!dateFilter && (
+            <select
+              value={days}
+              onChange={(e) => setDays(Number(e.target.value))}
+              className="bg-gray-800 border border-gray-700 text-gray-200 rounded-lg px-3 py-1.5 text-xs"
+            >
+              <option value={7}>Last 7 days</option>
+              <option value={14}>Last 14 days</option>
+              <option value={30}>Last 30 days</option>
+              <option value={90}>Last 90 days</option>
+              <option value={365}>Last year</option>
+            </select>
+          )}
+        </div>
       </div>
+
+      {/* No data for selected date */}
+      {dateFilter && filteredDaily.length === 0 && (
+        <div className="bg-amber-900/20 border border-amber-700/40 rounded-xl p-4 mb-6 text-amber-400 text-sm">
+          No reconciled results found for {dateFilter}. Results are reconciled the following morning by the nightly cycle.
+        </div>
+      )}
 
       {/* Stat cards */}
       <div className="grid grid-cols-2 md:grid-cols-4 gap-3 mb-6">
         <StatCard
           label="Top Pick Win Rate"
-          value={`${(top_pick.win_rate * 100).toFixed(1)}%`}
-          sub={`${top_pick.wins}/${top_pick.total} wins`}
-          color={top_pick.win_rate > 0.2 ? 'emerald' : top_pick.win_rate > 0.1 ? 'amber' : 'red'}
+          value={`${(displayWinRate * 100).toFixed(1)}%`}
+          sub={`${displayWins}/${displayTotal} wins`}
+          color={displayWinRate > 0.2 ? 'emerald' : displayWinRate > 0.1 ? 'amber' : 'red'}
         />
         <StatCard
           label="Top Pick Place Rate"
-          value={`${(top_pick.place_rate * 100).toFixed(1)}%`}
-          sub={`${top_pick.places}/${top_pick.total} placed`}
-          color={top_pick.place_rate > 0.5 ? 'emerald' : top_pick.place_rate > 0.3 ? 'amber' : 'red'}
+          value={`${(displayPlaceRate * 100).toFixed(1)}%`}
+          sub={`${displayPlaces}/${displayTotal} placed`}
+          color={displayPlaceRate > 0.5 ? 'emerald' : displayPlaceRate > 0.3 ? 'amber' : 'red'}
         />
         <StatCard
           label="Top 3 Place Rate"
-          value={`${(top_3_picks.place_rate * 100).toFixed(1)}%`}
-          sub={`${top_3_picks.placed}/${top_3_picks.total}`}
+          value={filteredStats ? '—' : `${(top_3_picks.place_rate * 100).toFixed(1)}%`}
+          sub={filteredStats ? 'rolling only' : `${top_3_picks.placed}/${top_3_picks.total}`}
           color={top_3_picks.place_rate > 0.4 ? 'emerald' : 'amber'}
         />
         <StatCard
           label="ROI (flat stake)"
-          value={`${roi.roi_pct >= 0 ? '+' : ''}${roi.roi_pct.toFixed(1)}%`}
-          sub={`P/L: ${roi.profit_loss >= 0 ? '+' : ''}${roi.profit_loss.toFixed(2)}`}
-          color={roi.roi_pct > 0 ? 'emerald' : roi.roi_pct > -10 ? 'amber' : 'red'}
+          value={`${displayRoi >= 0 ? '+' : ''}${displayRoi.toFixed(1)}%`}
+          sub={filteredStats ? `${filteredStats.races} races` : `P/L: ${roi.profit_loss >= 0 ? '+' : ''}${roi.profit_loss.toFixed(2)}`}
+          color={displayRoi > 0 ? 'emerald' : displayRoi > -10 ? 'amber' : 'red'}
         />
       </div>
 
@@ -122,7 +210,7 @@ export function Performance() {
       {daily.length > 0 && (
         <div className="bg-gray-900 border border-gray-800 rounded-2xl p-5 mb-6">
           <h2 className="text-sm font-semibold text-white mb-3 uppercase tracking-wider">
-            Daily Breakdown
+            {dateFilter ? `Results — ${dateFilter}` : 'Daily Breakdown'}
           </h2>
           <div className="overflow-x-auto">
             <table className="w-full text-sm">
@@ -137,7 +225,7 @@ export function Performance() {
                 </tr>
               </thead>
               <tbody>
-                {daily.map((d) => (
+                {filteredDaily.map((d) => (
                   <motion.tr
                     key={d.date}
                     initial={{ opacity: 0 }}
