@@ -59,6 +59,8 @@ class RaceInfo(BaseModel):
     surface: Optional[str] = None
     num_runners: int = 0
     region_code: Optional[str] = None
+    top_gap: Optional[float] = None
+    full_field: Optional[bool] = None
 
 
 class RaceCard(BaseModel):

@@ -200,6 +200,7 @@ def precompute_for_date(target_date: str):
 
     features_df = features_df.copy()
     features_df["_win_prob_raw"] = win_probs
+    features_df["_win_prob_precap"] = 0.0
     features_df["_place_prob_raw"] = place_probs
 
     # --- Per-race: filter NRs, normalize, quality-check ---
@@ -262,6 +263,9 @@ def precompute_for_date(target_date: str):
         # Normalize win probs to sum to 1.0 across active runners
         raw_win = features_df.loc[active_idx, "_win_prob_raw"].values.copy()
         norm_win = _normalize_probs(raw_win, 1.0)
+
+        # Store pre-cap probs (the model's honest opinion before any cap)
+        features_df.loc[active_idx, "_win_prob_precap"] = norm_win.copy()
 
         MAX_WIN_PROB = 0.70
         if norm_win.max() > MAX_WIN_PROB and len(active_idx) > 2:
@@ -374,13 +378,33 @@ def precompute_for_date(target_date: str):
 
         runners.sort(key=lambda r: r["win_prob"], reverse=True)
 
+        # Honest gap: pre-cap win prob of #1 minus #2 (model's real opinion)
+        precap_col = "_win_prob_precap"
+        if precap_col in active_features.columns and len(active_features) >= 2:
+            sorted_precap = active_features.sort_values("_win_prob", ascending=False)
+            top_precap = float(sorted_precap.iloc[0][precap_col])
+            second_precap = float(sorted_precap.iloc[1][precap_col])
+            meta["top_gap"] = round(top_precap - second_precap, 4)
+        else:
+            meta["top_gap"] = 0.0
+
+        ghost_count = sum(
+            1 for ru in runners
+            if ru.get("dimensions") and
+            sum(d.get("score", 0) for d in ru["dimensions"]) / len(ru["dimensions"]) < 35
+        )
+        meta["full_field"] = ghost_count == 0
+
         cache["races"][str(race_id)] = {
             "meta": meta,
             "runners": runners,
             "runner_api_ids": runner_api_map.get(race_id, {}),
         }
 
-    # --- Best bets (from normalized, NR-filtered data) ---
+    # --- Best bets (data quality + probability gap + confidence) ---
+    MIN_DATA_QUALITY = 50.0
+    MIN_PROB_GAP = 0.05
+
     active_df = features_df[features_df["_win_prob"] > 0]
     candidates = []
     for race_id, group in active_df.groupby("race_id"):
@@ -398,15 +422,91 @@ def precompute_for_date(target_date: str):
         field_avg_pp = group["_place_prob"].mean()
         edge = pp - field_avg_pp
 
+        # Honest gap: use pre-cap probs (model's real opinion, no 70% cap distortion)
+        precap_col = "_win_prob_precap"
+        if precap_col in sorted_group.columns:
+            top_precap = float(sorted_group.iloc[0][precap_col])
+            second_precap = float(sorted_group.iloc[1][precap_col]) if len(sorted_group) > 1 else 0.0
+            raw_gap = top_precap - second_precap
+        else:
+            raw_gap = wp - (float(sorted_group.iloc[1]["_win_prob"]) if len(sorted_group) > 1 else 0.0)
+
+        # Scale gap by field size: a 15% gap in a 6-runner race is more
+        # meaningful than 15% in a 22-runner race
+        n_runners = len(group)
+        fair_share = 1.0 / max(n_runners, 1)
+        prob_gap = raw_gap / max(fair_share, 0.01)
+
         jt = jt_map.get((top["horse_name"], race_id), (None, None))
 
+        race_data = cache["races"].get(str(race_id))
+        data_quality = 0.0
+        race_data_quality = 0.0
+        weak_runners = 0
+        total_runners_checked = 0
+        if race_data:
+            runner_scores = []
+            for runner in race_data["runners"]:
+                dims = runner.get("dimensions", [])
+                if dims:
+                    avg = sum(d.get("score", 0) for d in dims) / len(dims)
+                else:
+                    avg = 0.0
+                runner_scores.append(avg)
+                total_runners_checked += 1
+                if avg < 35:
+                    weak_runners += 1
+                if runner["horse_name"] == str(top["horse_name"]):
+                    data_quality = avg
+            if runner_scores:
+                race_data_quality = sum(runner_scores) / len(runner_scores)
+
+        if weak_runners > 0:
+            logger.info(
+                f"  BEST BET SKIP: {meta.get('race_time','')} {meta.get('course','')}: "
+                f"{weak_runners}/{total_runners_checked} runners have weak data (<35%) — ghost horses"
+            )
+            continue
+
+        if race_data_quality < MIN_DATA_QUALITY:
+            logger.info(
+                f"  BEST BET SKIP: {meta.get('race_time','')} {meta.get('course','')}: "
+                f"race avg data={race_data_quality:.0f}% < {MIN_DATA_QUALITY}% — incomplete field"
+            )
+            continue
+
+        if data_quality < MIN_DATA_QUALITY:
+            logger.info(
+                f"  BEST BET SKIP: {top['horse_name']} ({meta.get('race_time','')} "
+                f"{meta.get('course','')}) top pick data={data_quality:.0f}% < {MIN_DATA_QUALITY}%"
+            )
+            continue
+
+        # prob_gap is now field-adjusted: how many times the gap exceeds
+        # a fair share (1/n_runners). 3.0+ is strong, 5.0 is max for scoring.
+        gap_score = min(prob_gap / 5.0, 1.0)
+
+        combined_score = (
+            0.30 * ew +
+            0.30 * gap_score +
+            0.25 * (data_quality / 100.0) +
+            0.15 * (race_data_quality / 100.0)
+        )
+
         reason_parts = []
+        reason_parts.append(f"full field data ({total_runners_checked}/{total_runners_checked})")
+        if data_quality >= 60:
+            reason_parts.append(f"strong data ({data_quality:.0f}%)")
+        elif data_quality >= 50:
+            reason_parts.append(f"solid data ({data_quality:.0f}%)")
+        if prob_gap >= 3.0:
+            reason_parts.append(f"real gap {raw_gap*100:.0f}% ({prob_gap:.1f}x fair share)")
+        elif prob_gap >= 1.5:
+            reason_parts.append(f"gap {raw_gap*100:.0f}% ({prob_gap:.1f}x fair share)")
         if pp > 0.45:
             reason_parts.append("strong place chance")
         if wp > 0.2:
             reason_parts.append("genuine win contender")
-        if gap > 0.25:
-            reason_parts.append(f"{gap*100:.0f}% place safety net")
         if edge > 0.15:
             reason_parts.append("big edge over field")
         if top.get("form_avg_pos_3") and pd.notna(top.get("form_avg_pos_3")) and float(top.get("form_avg_pos_3", 99)) <= 3.0:
@@ -422,16 +522,19 @@ def precompute_for_date(target_date: str):
             "race_id": int(race_id),
             "win_prob": round(wp, 4),
             "place_prob": round(pp, 4),
-            "pct_gap": round(gap, 4),
+            "pct_gap": round(raw_gap, 4),
             "fair_odds": round(1.0 / max(wp, 0.001), 2),
             "jockey": jt[0],
             "trainer": jt[1],
             "official_rating": int(top["official_rating"]) if pd.notna(top.get("official_rating")) else None,
-            "confidence": round(ew, 4),
+            "confidence": round(combined_score, 4),
+            "data_quality": round(data_quality, 1),
+            "race_data_quality": round(race_data_quality, 1),
+            "field_coverage": f"{total_runners_checked}/{total_runners_checked}",
             "reason": " + ".join(reason_parts),
         })
 
-    candidates.sort(key=lambda c: (c["confidence"], c["pct_gap"]), reverse=True)
+    candidates.sort(key=lambda c: c["confidence"], reverse=True)
 
     seen = set()
     top_picks = []
@@ -442,6 +545,16 @@ def precompute_for_date(target_date: str):
         top_picks.append(c)
         if len(top_picks) == 4:
             break
+
+    if top_picks:
+        logger.info("Best bets selected (honest gap + data quality):")
+        for p in top_picks:
+            logger.info(
+                f"  {p['race_time']} {p['course']}: {p['horse_name']} "
+                f"win={p['win_prob']:.1%} gap={p['pct_gap']:.1%} "
+                f"horse={p['data_quality']:.0f}% race={p['race_data_quality']:.0f}% "
+                f"field={p['field_coverage']} score={p['confidence']:.3f}"
+            )
 
     cache["best_bets"] = {
         "date": target_date,

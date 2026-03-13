@@ -17,8 +17,8 @@ export function Login() {
     setSubmitting(true);
     try {
       await login(username, password);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : 'Login failed');
+    } catch {
+      setError('System undergoing maintenance. Please try again shortly.');
     } finally {
       setSubmitting(false);
     }

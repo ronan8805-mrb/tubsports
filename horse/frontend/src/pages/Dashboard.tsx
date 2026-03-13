@@ -200,6 +200,9 @@ export function Dashboard() {
                     <span className="text-sm font-semibold text-white group-hover:text-emerald-400 transition-colors">
                       Race {race.race_number ?? '?'}
                     </span>
+                    {race.full_field === true && (
+                      <span style={{background:'#16a34a',color:'#fff',fontWeight:'bold',padding:'2px 6px',borderRadius:'4px',fontSize:'11px',whiteSpace:'nowrap'}}>FULL DATA</span>
+                    )}
                   </div>
                   <span className="text-xs text-gray-500">
                     {race.num_runners} runners
@@ -239,6 +242,18 @@ export function Dashboard() {
                     </span>
                   )}
                 </div>
+
+                {race.top_gap != null && (
+                  <div className="mt-2 flex items-center gap-1.5">
+                    <span className="text-[10px] text-gray-600">Gap #1 vs #2:</span>
+                    <span className={`text-[11px] font-bold ${
+                      race.top_gap >= 0.15 ? 'text-emerald-400' :
+                      race.top_gap >= 0.08 ? 'text-amber-400' : 'text-gray-500'
+                    }`}>
+                      {(race.top_gap * 100).toFixed(1)}%
+                    </span>
+                  </div>
+                )}
               </button>
             ))}
           </div>

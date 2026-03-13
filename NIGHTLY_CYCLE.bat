@@ -19,6 +19,7 @@ echo   6. Incremental retrain (stacked ensemble)
 echo   7. Model monitoring + drift detection
 echo   8. Pre-compute predictions for tomorrow
 echo   9. Refresh odds for tomorrow
+echo  10. Rebuild frontend (fresh JS bundle)
 echo.
 
 :: ---- Step 1: Scrape recent results ----
@@ -73,6 +74,14 @@ echo.
 echo [%TIME%] Step 9: Refreshing odds for upcoming races...
 python -u -c "import requests; r=requests.post('http://localhost:8002/api/refresh-odds', timeout=5); print(f'  Odds refresh: {r.json()}')" 2>nul
 if errorlevel 1 echo [%TIME%] INFO: Odds refresh skipped (API may not be running)
+
+:: ---- Step 10: Rebuild frontend ----
+echo.
+echo [%TIME%] Step 10: Rebuilding frontend (fresh JS bundle)...
+cd /d "%~dp0horse\frontend"
+call npm run build
+if errorlevel 1 echo [%TIME%] WARNING: Frontend build had errors
+cd /d "%~dp0"
 
 echo.
 if %ERRORLEVEL% EQU 0 (

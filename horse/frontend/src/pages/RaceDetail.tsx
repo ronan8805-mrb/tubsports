@@ -90,6 +90,17 @@ export function RaceDetail() {
           <span className="px-2 py-0.5 sm:px-2.5 sm:py-1 rounded-lg text-[10px] sm:text-xs font-medium bg-sky-500/10 text-sky-400 border border-sky-500/20">
             {race_info.num_runners} runners
           </span>
+          {race_info.top_gap != null && (
+            <span className={`px-2 py-0.5 sm:px-2.5 sm:py-1 rounded-lg text-[10px] sm:text-xs font-medium border ${
+              race_info.top_gap >= 0.15
+                ? 'bg-emerald-500/10 text-emerald-400 border-emerald-500/20'
+                : race_info.top_gap >= 0.08
+                  ? 'bg-amber-500/10 text-amber-400 border-amber-500/20'
+                  : 'bg-gray-500/10 text-gray-400 border-gray-500/20'
+            }`}>
+              Gap {(race_info.top_gap * 100).toFixed(1)}%
+            </span>
+          )}
         </div>
       </div>
 

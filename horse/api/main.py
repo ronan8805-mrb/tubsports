@@ -203,6 +203,9 @@ def get_races(
 
             # Use cached active runner count if available, otherwise DB value
             num_runners = cached_runner_counts.get(rid, r[11] or 0)
+            cached_meta = cached_races.get(str(rid), {}).get("meta", {})
+            top_gap = cached_meta.get("top_gap")
+            full_field = cached_meta.get("full_field")
 
             races.append(RaceInfo(
                 race_id=rid,
@@ -218,6 +221,8 @@ def get_races(
                 surface=r[10],
                 num_runners=num_runners,
                 region_code=r[12],
+                top_gap=top_gap,
+                full_field=full_field,
             ))
 
         return RaceCard(
@@ -312,6 +317,11 @@ def get_thirteen_d(race_id: int):
 
             # Override num_runners with actual active runner count from cache
             race_info.num_runners = len(cached_runners)
+            cached_meta = cached_race.get("meta", {})
+            if "top_gap" in cached_meta:
+                race_info.top_gap = cached_meta["top_gap"]
+            if "full_field" in cached_meta:
+                race_info.full_field = cached_meta["full_field"]
 
             jt_rows = con.execute("""
                 SELECT horse_name, jockey_name, trainer_name, api_horse_id, silk_url
@@ -962,8 +972,27 @@ def staking_calculator(
 # ---------------------------------------------------------------------------
 
 _FRONTEND_DIST = Path(__file__).parent.parent / "frontend" / "dist"
+_INDEX_HTML = _FRONTEND_DIST / "index.html"
+
 if _FRONTEND_DIST.exists():
-    app.mount("/", StaticFiles(directory=str(_FRONTEND_DIST), html=True), name="static")
+    app.mount("/assets", StaticFiles(directory=str(_FRONTEND_DIST / "assets")), name="assets")
+
+    @app.get("/", include_in_schema=False)
+    @app.get("/{full_path:path}", include_in_schema=False)
+    async def serve_spa(full_path: str = ""):
+        from fastapi.responses import FileResponse, Response
+        if full_path and (asset := _FRONTEND_DIST / full_path).is_file():
+            return FileResponse(str(asset))
+        content = _INDEX_HTML.read_bytes()
+        return Response(
+            content=content,
+            media_type="text/html",
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+                "Expires": "0",
+            },
+        )
 
 
 def start():

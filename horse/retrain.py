@@ -306,19 +306,32 @@ def main():
                 writer.writerow([feat, f"{val:.2f}", rank])
         logger.info(f"Feature importance saved: {imp_path}")
 
-        # Calibration report
+        # Calibration report (using calibrated predictions to reflect what's actually served)
         try:
             test_preds = win.get("test_predictions")
             test_actuals = win.get("test_actuals")
             if test_preds is not None and test_actuals is not None:
                 import numpy as np
+                calibrator = win.get("calibrator")
+                if calibrator is not None:
+                    try:
+                        if hasattr(calibrator, "predict_proba"):
+                            report_preds = calibrator.predict_proba(test_preds.reshape(-1, 1))[:, 1]
+                        else:
+                            report_preds = calibrator.predict(test_preds.reshape(-1, 1))
+                        logger.info("Calibration report uses calibrated predictions")
+                    except Exception:
+                        report_preds = test_preds
+                else:
+                    report_preds = test_preds
+                    logger.warning("No calibrator found — calibration report uses raw predictions")
                 cal_bins = []
                 for lo in range(0, 100, 10):
                     hi = lo + 10
-                    mask = (test_preds >= lo / 100) & (test_preds < hi / 100)
+                    mask = (report_preds >= lo / 100) & (report_preds < hi / 100)
                     n = int(mask.sum())
                     if n > 0:
-                        predicted = float(test_preds[mask].mean())
+                        predicted = float(report_preds[mask].mean())
                         actual = float(test_actuals[mask].mean())
                     else:
                         predicted = (lo + hi) / 200

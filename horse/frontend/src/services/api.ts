@@ -30,6 +30,8 @@ export interface RaceInfo {
   surface: string | null;
   num_runners: number;
   region_code: string | null;
+  top_gap: number | null;
+  full_field: boolean | null;
 }
 
 export interface RaceCard {
@@ -350,4 +352,5 @@ export const api = {
     const qs = date ? `?date=${date}` : '';
     return fetchJson<BestBetsResponse>(`/best-bets${qs}`);
   },
+
 };
