@@ -32,7 +32,7 @@ export function Performance() {
 
   // Filter daily rows by selected date
   const filteredDaily = dateFilter
-    ? (data?.daily || []).filter((d) => d.date === dateFilter)
+    ? (data?.daily || []).filter((d) => d.date.startsWith(dateFilter))
     : (data?.daily || []);
 
   // Aggregate stats from filtered daily rows (used when date filter is active)
